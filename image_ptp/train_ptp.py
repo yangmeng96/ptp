@@ -105,7 +105,7 @@ def evaluate(model, data, indices, starts, block_len, device, nn_idx=None, embed
     tokens, labels = data["tokens"], data["labels"]
     left_all, right_all = data["left_bin_edges"], data["right_bin_edges"]
 
-    correct_runs, hits, totals = [], 0, 0
+    correct_runs, hits, totals, shuffled_hits = [], 0, 0, 0
     relaxed_runs = {j: [] for j in RELAXED_J} if nn_idx is not None else {}
     err_rank = []
 
@@ -122,6 +122,13 @@ def evaluate(model, data, indices, starts, block_len, device, nn_idx=None, embed
             proposed = logits.argmax(dim=-1)
             truth = tok[:, start:stop + 1]
             correct = proposed == truth
+
+            # Same evaluation with auxiliaries borrowed from other sequences.
+            # If accuracy holds up, the student is not using u at all and has
+            # only learned the teacher's marginal.
+            shuffled = model.student_logits(
+                lab, tok, u[torch.randperm(u.shape[0], device=device)], start)
+            shuffled_hits += int((shuffled.argmax(dim=-1) == truth).sum())
 
             correct_runs.append(leading_run(correct).cpu())
             hits += int(correct.sum())
@@ -143,6 +150,8 @@ def evaluate(model, data, indices, starts, block_len, device, nn_idx=None, embed
     runs = torch.cat(correct_runs).float()
     out = {
         "token_accuracy": hits / max(totals, 1),
+        "shuffled_u_accuracy": shuffled_hits / max(totals, 1),
+        "u_lift": hits / max(shuffled_hits, 1),
         "correct_per_block_mean": runs.mean().item(),
         "accepted_per_step_mean": (runs + 1).clamp(max=block_len).mean().item(),
         "frac_zero_correct": (runs == 0).float().mean().item(),
@@ -247,6 +256,8 @@ def main():
             metrics["step"] = step + 1
             history.append(metrics)
             print(f"  eval @ {step + 1}: acc={metrics['token_accuracy']:.4f} "
+                  f"shuf={metrics['shuffled_u_accuracy']:.4f} "
+                  f"lift={metrics['u_lift']:.2f}x "
                   f"correct/block={metrics['correct_per_block_mean']:.2f} "
                   f"accepted/step={metrics['accepted_per_step_mean']:.2f}"
                   + (f" | relaxed j8={metrics.get('relaxed_j8_correct_mean', 0):.2f} "

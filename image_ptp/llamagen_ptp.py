@@ -250,5 +250,17 @@ def load_llamagen(llamagen_root, gpt_model, gpt_ckpt, image_size=256, downsample
     missing, unexpected = gpt.load_state_dict(ckpt, strict=False)
     if missing:
         print(f"missing keys: {len(missing)} (first: {missing[:3]})")
+
+    # `freqs_cis` is a plain attribute, so `.to()` never moves it, and
+    # `setup_caches` rebuilds it on whatever device is current. The CPU and GPU
+    # tables differ by one float32 ULP, which is enough to move a third of the
+    # narrow bins here into a different token. Pin it to one canonical version
+    # so every process agrees on what `u` selects.
+    with torch.device(device):
+        from autoregressive.models.gpt import precompute_freqs_cis_2d
+        grid = int(seq_len ** 0.5)
+        gpt.freqs_cis = precompute_freqs_cis_2d(
+            grid, gpt.config.dim // gpt.config.n_head,
+            gpt.config.rope_base, cls_token_num)
     gpt.eval()
     return gpt, seq_len
