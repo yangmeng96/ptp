@@ -128,7 +128,7 @@ def summarize(widths, eff_cands, supports):
     return {
         "bin_width_mean": w.mean().item(),
         "bin_width_quantiles": dict(zip(
-            [f"p{int(q * 100)}" for q in quantiles.tolist()],
+            [f"p{round(q * 100)}" for q in quantiles.tolist()],
             torch.quantile(w, quantiles).tolist(),
         )),
         "frac_width_below_1e-2": (w < 1e-2).float().mean().item(),
