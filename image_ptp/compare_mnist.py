@@ -67,7 +67,7 @@ def main():
         num_layers=ck["num_layers"], dim_feedforward=ck["dim_feedforward"],
         max_seq_len=ck["max_seq_len"],
     ).to(device).eval()
-    student.load_state_dict(ck["student"])
+    student.load_state_dict(ck["ptp"])
     print(f"MNIST: {num_codes} codes, block_len={block_len}, epoch={ck['epoch']}")
 
     ds = datasets.MNIST(root="data/mnist", train=False, download=False, transform=tfm)
