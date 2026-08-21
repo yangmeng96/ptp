@@ -53,7 +53,13 @@ def main():
 
     b = args.batch_size
     cond = torch.randint(0, 1000, (b,), device=device)
-    tokens = torch.randint(0, model.vocab_size, (b, seq_len), device=device)
+    # Real samples, not random ids: the teacher assigns near-zero probability to
+    # random tokens, which would make the bin-width check vacuous.
+    from autoregressive.models.generate import generate
+    tokens = generate(model.base, cond, seq_len, cfg_scale=4.0, cfg_interval=-1,
+                      temperature=1.0, top_k=100, top_p=1.0).long()
+    for block in model.base.layers:
+        block.attention.kv_cache = None
     passed = []
 
     # 1. The teacher path must match LlamaGen's own forward over the same input.
@@ -65,15 +71,17 @@ def main():
     delta = (ours - ref_logits).abs().max().item()
     passed.append(report("teacher matches LlamaGen forward", delta < 2e-3, f"max|d|={delta:.2e}"))
 
-    # 2. Feeding true token embeddings as the block must reproduce the teacher's
-    #    logits over that span. This is what pins down positions and masking:
-    #    a shifted RoPE index or a wrong mask shows up here and nowhere else.
+    # 2. Hand the block real token embeddings and hold back the prefix token
+    #    they duplicate: the concatenation is then ordinary autoregression, so
+    #    the block logits must equal the teacher's. This is what pins down
+    #    positions and masking -- a shifted RoPE index or a wrong mask shows up
+    #    here and nowhere else.
     start, block_len = 100, 16
     stop = start + block_len - 1
     block_tokens = tokens[:, start - 1:stop]  # t_{start-1} .. t_{stop-1}
     with model.adapters(False):
         block_logits = model.block_forward(
-            cond, tokens[:, :start],
+            cond, tokens[:, :start - 1],
             model.base.tok_embeddings(block_tokens), start)
     expect = ref_logits[:, start:stop + 1]
     delta = (block_logits - expect).abs().max().item()

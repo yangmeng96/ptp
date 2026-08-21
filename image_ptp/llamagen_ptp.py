@@ -171,9 +171,11 @@ class LlamaGenPTP(nn.Module):
     def block_forward(self, cond, prefix, block_embeds, start):
         """Run [class | prefix | block] and return the logits over the block.
 
-        Split out from `student_logits` so the layout can be tested by feeding
-        real token embeddings as the block: the result must then match the
-        teacher's own logits over the same span.
+        `start` is the RoPE index of the block's first slot, independent of how
+        many prefix tokens are supplied. Split out from `student_logits` so the
+        layout can be tested: hand it one fewer prefix token and a block of real
+        token embeddings and the concatenation becomes plain autoregression, so
+        the output must match the teacher over the same span.
         """
         device = prefix.device
         block_len = block_embeds.shape[1]
@@ -182,7 +184,7 @@ class LlamaGenPTP(nn.Module):
             self.base.tok_embeddings(prefix),
             block_embeds,
         ], dim=1)
-        prefix_len = 1 + start  # class token plus the prefix tokens
+        prefix_len = self.cls_token_num + prefix.shape[1]
 
         # The prefix runs 0..start; u_k takes RoPE index k, so the block runs
         # start..stop and deliberately reuses index `start`.
