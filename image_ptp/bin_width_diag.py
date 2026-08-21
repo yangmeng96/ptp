@@ -34,6 +34,11 @@ def parse_args():
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--cls-token-num", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=16, help="images per sweep config")
+    parser.add_argument("--uncond", action="store_true",
+                        help="condition on the null class, i.e. sample unconditionally")
+    parser.add_argument("--configs", type=str, default=None,
+                        help="override the sweep, as cfg:top_k:top_p:temp entries "
+                             "separated by commas, e.g. 1.0:100:1.0:1.0")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", type=str, default="bin_width_stats.json")
     return parser.parse_args()
@@ -51,6 +56,14 @@ SWEEP = [
     (4.0, 2000, 1.0, 0.9),
     (4.0, 2000, 0.9, 1.0),
 ]
+
+
+def parse_configs(spec):
+    out = []
+    for chunk in spec.split(","):
+        cfg, top_k, top_p, temp = chunk.split(":")
+        out.append((float(cfg), int(top_k), float(top_p), float(temp)))
+    return out
 
 
 @torch.no_grad()
@@ -174,22 +187,33 @@ def main():
     del checkpoint
     print(f"loaded {args.gpt_model} from {args.gpt_ckpt}, seq_len={seq_len}")
 
+    sweep = parse_configs(args.configs) if args.configs else SWEEP
+    if args.uncond:
+        assert all(c[0] == 1.0 for c in sweep), \
+            "unconditional sampling is only meaningful without guidance (cfg 1.0)"
+
     results = []
-    for cfg_scale, top_k, top_p, temperature in SWEEP:
+    for cfg_scale, top_k, top_p, temperature in sweep:
         torch.manual_seed(args.seed)
-        cond = torch.randint(0, args.num_classes, (args.batch_size,), device=device)
+        if args.uncond:
+            # The null class is the token LlamaGen uses for the unguided branch.
+            cond = torch.full((args.batch_size,), args.num_classes, device=device)
+        else:
+            cond = torch.randint(0, args.num_classes, (args.batch_size,), device=device)
         widths, eff_cands, supports = generate_with_stats(
             model, sample_fn, cond, seq_len,
             cfg_scale=cfg_scale, cfg_interval=-1,
             temperature=temperature, top_k=top_k, top_p=top_p,
         )
         entry = {
+            "uncond": args.uncond,
             "cfg_scale": cfg_scale, "top_k": top_k, "top_p": top_p,
             "temperature": temperature,
             **summarize(widths, eff_cands, supports),
         }
         results.append(entry)
-        print(f"cfg={cfg_scale} top_k={top_k} top_p={top_p} temp={temperature} | "
+        print(f"{'uncond' if args.uncond else 'cond'} "
+              f"cfg={cfg_scale} top_k={top_k} top_p={top_p} temp={temperature} | "
               f"width mean={entry['bin_width_mean']:.4f} "
               f"median={entry['bin_width_quantiles']['p50']:.4f} | "
               f"eff_cand mean={entry['eff_candidates_mean']:.1f} | "
