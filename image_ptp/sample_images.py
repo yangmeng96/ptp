@@ -82,6 +82,10 @@ def main():
     from models.ar import seq_to_codes_grid
     from utils.helper import load_vqvae
     from torchvision.utils import save_image
+
+    # load_vqvae reads its weights by a path relative to the repo, so stay here
+    # until it has them.
+    vqvae, _ = load_vqvae("mnist", device)
     os.chdir(repo_cwd)
 
     from image_ptp.vqvae_ar_hf import build, build_module
@@ -91,7 +95,6 @@ def main():
     h, w, bos = meta["h"], meta["w"], meta["num_codes"]
     seq_len = h * w
     inv = torch.argsort(meta["perm"]).to(device)
-    vqvae, _ = load_vqvae("mnist", device)
     out_dir = Path(args.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
 
