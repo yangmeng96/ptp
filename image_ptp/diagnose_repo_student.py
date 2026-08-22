@@ -1,0 +1,126 @@
+"""Does the student trained through the PTP repo actually use the auxiliaries?
+
+`val/correct` cannot answer this. A student that ignores u entirely and predicts
+the teacher's marginal still scores above zero on it, and that is exactly the
+failure mode every earlier LlamaGen attempt fell into. The test that separates
+the two is to re-run the same evaluation with auxiliaries taken from other
+sequences: if accuracy barely moves, u is not being read.
+
+The reference point is the MNIST run in `~/ptp-vqvae`, which scores 1.70x on
+this test. Every LlamaGen run so far has scored 1.0x.
+
+Usage:
+    PYTHONPATH=src:. python image_ptp/diagnose_repo_student.py \
+        --llamagen-root ~/LlamaGen --data <pregen.pt> \
+        --ckpt ~/ptp-image-exp/llamagen-b-k100/last.ckpt
+"""
+import argparse
+from pathlib import Path
+
+import torch
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--llamagen-root", type=str, required=True)
+    p.add_argument("--gpt-model", type=str, default="GPT-B")
+    p.add_argument("--gpt-ckpt", type=str, default=None)
+    p.add_argument("--data", type=str, required=True)
+    p.add_argument("--ckpt", type=str, required=True)
+    p.add_argument("--lora-rank", type=int, default=128)
+    p.add_argument("--top-k", type=int, default=100)
+    p.add_argument("--top-p", type=float, default=0.999)
+    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--num-completions", type=int, default=32)
+    p.add_argument("--completion-len", type=int, default=16)
+    p.add_argument("--batches", type=int, default=16)
+    p.add_argument("--seed", type=int, default=0)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    torch.set_grad_enabled(False)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    from image_ptp.llamagen_hf import build
+    from image_ptp.image_data import ImageTokenDataModule
+    from ptp.transformer import MixedTransformerModel
+    from ptp.lit import ParallelSamplingLightningModule
+
+    root = Path(args.llamagen_root).expanduser()
+    gpt_ckpt = args.gpt_ckpt or str(root / "pretrained_models/c2i_B_256.pt")
+    inner, seq_len = build(root, args.gpt_model, gpt_ckpt,
+                           dtype=torch.float32, device=device)
+    model = MixedTransformerModel(
+        model_id=inner, dtype=torch.float32,
+        lora_config={"r": args.lora_rank,
+                     "target_modules": ["wqkv", "wo", "w1", "w2", "w3"]},
+        attn_implementation="flex_attention",
+    ).to(device)
+    lit = ParallelSamplingLightningModule(
+        model=model, optim_cfg={"lr": 1e-4, "lr_warmup": 10},
+        top_k=args.top_k, top_p=args.top_p, temperature=1.0,
+    ).to(device)
+
+    state = torch.load(Path(args.ckpt).expanduser(), map_location="cpu",
+                       weights_only=False)["state_dict"]
+    missing, unexpected = lit.load_state_dict(state, strict=False)
+    trained = [k for k in state if "lora_" in k or "u_embed" in k]
+    print(f"loaded {len(state)} tensors ({len(trained)} adapter/auxiliary), "
+          f"{len(missing)} missing, {len(unexpected)} unexpected")
+    lit.eval()
+
+    dm = ImageTokenDataModule(args.data, args.completion_len,
+                              args.num_completions, args.batch_size)
+    dm.setup()
+
+    def run(shuffle_u):
+        hits = total = 0
+        runs = []
+        loader = dm.val_dataloader()
+        for i, batch in zip(range(args.batches), loader):
+            batch = {k: (v.to(device) if torch.is_tensor(v) else v)
+                     for k, v in batch.items()}
+            torch.manual_seed(args.seed + i)  # same u draw for both arms
+            with torch.autocast("cuda", dtype=torch.float16):
+                metrics = lit.forward(batch, eval=True, return_outputs=True)
+            # `forward` returns the sequence metrics the repo computes; the
+            # per-sample correct counts are what the acceptance number is made of.
+            counts = metrics.get("correct_counts")
+            if counts is not None:
+                runs.append(counts.float().cpu())
+            hits += float(metrics["accuracy"]) * 1.0
+            total += 1
+        acc = hits / max(total, 1)
+        run_len = torch.cat(runs).mean().item() if runs else float("nan")
+        return acc, run_len
+
+    # The shuffle is applied inside the model by permuting the auxiliaries, so
+    # patch the sampler rather than the batch: the repo derives u from the
+    # teacher's bin edges internally.
+    original = ParallelSamplingLightningModule.sample_auxiliaries
+
+    def shuffled(self, left, right, eval):
+        u = original(self, left, right, eval)
+        return u[torch.randperm(u.shape[0], device=u.device)]
+
+    real_acc, real_run = run(False)
+    ParallelSamplingLightningModule.sample_auxiliaries = shuffled
+    try:
+        shuf_acc, shuf_run = run(True)
+    finally:
+        ParallelSamplingLightningModule.sample_auxiliaries = original
+
+    print("\n--- does the student use u? ---")
+    print(f"accuracy   real u {real_acc:.4f}   shuffled {shuf_acc:.4f}   "
+          f"lift {real_acc / max(shuf_acc, 1e-9):.2f}x")
+    print(f"correct    real u {real_run:.4f}   shuffled {shuf_run:.4f}   "
+          f"lift {real_run / max(shuf_run, 1e-9):.2f}x")
+    print("\nMNIST reference (ptp-vqvae, works): 1.70x")
+    print("every earlier LlamaGen attempt:      1.0x")
+
+
+if __name__ == "__main__":
+    main()
