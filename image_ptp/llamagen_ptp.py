@@ -27,17 +27,28 @@ class BinaryFloatEmbedding(nn.Module):
     This is the scheme the PTP paper reports (Eq. 16). Bit-level input gives the
     network access to arbitrarily fine distinctions between nearby u, which
     matters here because image bins are narrow.
+
+    The output is projected onto the shell the token embeddings occupy. A
+    pretrained backbone forms its queries from whatever sits in the residual
+    stream, so an auxiliary vector of the wrong magnitude produces queries far
+    outside the distribution its attention was trained on -- it stops reading
+    the prefix at all. Default `nn.Linear` init on 32 binary inputs lands around
+    norm 12 against token embeddings at 0.94, which is enough to break it.
+    Those embeddings sit at near-constant norm, so matching that shell is the
+    natural target; `scale` stays learnable in case it is not exactly right.
     """
 
-    def __init__(self, dim):
+    def __init__(self, dim, target_norm=1.0):
         super().__init__()
         self.proj = nn.Linear(32, dim)
+        self.scale = nn.Parameter(torch.tensor(float(target_norm)))
 
     def forward(self, u):
         bits = u.to(torch.float32).view(torch.int32)
         masks = 2 ** torch.arange(31, -1, -1, device=u.device, dtype=torch.int32)
         expanded = ((bits[..., None] & masks) != 0).to(self.proj.weight.dtype)
-        return self.proj(expanded)
+        out = self.proj(expanded)
+        return out / out.norm(dim=-1, keepdim=True).clamp(min=1e-6) * self.scale
 
 
 def top_k_top_p_filter(logits, top_k=0, top_p=1.0):
@@ -76,6 +87,7 @@ class LlamaGenPTP(nn.Module):
 
         for p in gpt.parameters():
             p.requires_grad_(False)
+        token_norm = gpt.tok_embeddings.weight.detach().float().norm(dim=1).mean().item()
         self.gpt = get_peft_model(gpt, LoraConfig(
             r=lora_rank,
             lora_alpha=lora_alpha if lora_alpha is not None else lora_rank,
@@ -83,7 +95,7 @@ class LlamaGenPTP(nn.Module):
             target_modules=LORA_TARGETS,
             bias="none",
         ))
-        self.u_embed = BinaryFloatEmbedding(self.config.dim)
+        self.u_embed = BinaryFloatEmbedding(self.config.dim, target_norm=token_norm)
 
     @property
     def base(self):
