@@ -1,0 +1,47 @@
+# The repo on its own kind of model, as a control for two open questions.
+#
+# First, whether flex_attention compiles here at all. It fails inside the
+# Lightning loop on the wrapped MNIST AR model -- traced into Triton's LLVM
+# codegen, and not reproducible outside that loop. If TinyLlama compiles fine,
+# the failure is specific to the wrapped model; if it fails the same way, it is
+# this GPU and Triton build, and nothing to do with the wrappers.
+#
+# Second, it exercises `ptp.lit` against an unmodified HuggingFace model, which
+# is the configuration the repo was written for.
+#
+# The data is a synthetic token probe, not real text: this run is about whether
+# the machinery executes, not about what it learns.
+training:
+  n_steps: 60
+  precision: 16-mixed
+  eval_every_steps: 30
+  wandb_project: offline
+  check_point_interval:
+    minutes: 60
+
+model:
+  _target_: ptp.lit.ParallelSamplingLightningModule
+  optim_cfg:
+    lr: 0.0001
+    lr_warmup: 10
+  top_k: 100
+  top_p: 0.999
+  temperature: 1.0
+  model:
+    _target_: ptp.transformer.MixedTransformerModel
+    model_id: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+    dtype: float32
+    attn_implementation: flex_attention
+    lora_config:
+      r: 16
+      target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+data:
+  _target_: image_ptp.image_data.ImageTokenDataModule
+  data_path: /home/mengy13/ptp-image-results/text_probe_tokens.pt
+  # Text sequences already begin with their own token, so nothing is prepended.
+  prepend_label: false
+  num_completions: 16
+  train_completion_len: 8
+  batch_size: 4
+  num_workers: 2
