@@ -125,6 +125,14 @@ class LlamaGenForCausalLM(nn.Module):
         bsz, seqlen, _ = h.shape
         device = h.device
 
+        # HuggingFace models allocate a cache when asked to use one and given
+        # none, and hand it back on the output. PTP relies on that: `ar_forward`
+        # calls with `use_cache=True` and no cache, then feeds the returned
+        # object to the completion pass.
+        if use_cache and past_key_values is None:
+            from transformers import DynamicCache
+            past_key_values = DynamicCache()
+
         if position_ids is None:
             offset = 0
             if past_key_values is not None:
