@@ -161,6 +161,18 @@ class LlamaGenForCausalLM(nn.Module):
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         pass  # the image sequences are short; nothing to trade here
 
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None,
+                                      attention_mask=None, inputs_embeds=None, **kwargs):
+        # PEFT's causal-LM wrapper stores a reference to this at construction.
+        # Nothing here calls it -- PTP drives the model directly -- but it has
+        # to exist for `get_peft_model` to accept the module.
+        if past_key_values is not None:
+            cached = past_key_values.get_seq_length()
+            if cached:
+                input_ids = input_ids[:, cached:]
+        return {"input_ids": input_ids, "past_key_values": past_key_values,
+                "attention_mask": attention_mask, "use_cache": True}
+
     @property
     def device(self):
         return self.gpt.tok_embeddings.weight.device
