@@ -23,19 +23,36 @@ from torch import nn
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 _COMPILED_FLEX = None
+_COMPILE_FAILED = False
 
 
 def _flex(query, key, value, block_mask):
     """flex_attention is meant to be compiled; eager it costs an order of magnitude.
 
-    HuggingFace's own integration does the same thing, and `ptp.attention` is
-    written to keep the mask shapes fixed so the Triton kernel is compiled once.
-    Measured here: 11.5 s/step eager against 2.9 s/step compiled.
+    HuggingFace's own integration compiles it too, and `ptp.attention` keeps the
+    mask shapes fixed so the Triton kernel is built once. Measured here: 11.5
+    s/step eager against 2.9 s/step compiled, so the compiled path is worth
+    insisting on when it works.
+
+    It does not always work. On this machine -- Turing, sm_75 -- Triton's LLVM
+    codegen raises `IndexError: map::at` for some kernel configurations,
+    including the one an unmodified TinyLlama produces through the repo's own
+    path. Eager flex_attention agrees with the compiled kernel to 1e-5 on both
+    the output and the gradients, so falling back costs speed and nothing else.
     """
-    global _COMPILED_FLEX
-    if _COMPILED_FLEX is None:
-        _COMPILED_FLEX = torch.compile(flex_attention, dynamic=False)
-    return _COMPILED_FLEX(query, key, value, block_mask=block_mask)
+    global _COMPILED_FLEX, _COMPILE_FAILED
+    if not _COMPILE_FAILED:
+        try:
+            if _COMPILED_FLEX is None:
+                _COMPILED_FLEX = torch.compile(flex_attention, dynamic=False)
+            return _COMPILED_FLEX(query, key, value, block_mask=block_mask)
+        except Exception:
+            _COMPILE_FAILED = True
+            import traceback
+            print("flex_attention compile failed; falling back to eager. "
+                  "Full traceback follows:")
+            traceback.print_exc()
+    return flex_attention(query, key, value, block_mask=block_mask)
 
 
 @dataclass
