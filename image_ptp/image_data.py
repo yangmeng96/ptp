@@ -26,7 +26,9 @@ class ImageTokenDataset(Dataset):
     0 holds the class and `ptp.lit` asserts every start is positive.
     """
 
-    def __init__(self, tokens, labels, code_vocab, num_completions, completion_length):
+    def __init__(self, tokens, labels, code_vocab, num_completions, completion_length,
+                 prepend_label=True):
+        self.prepend_label = prepend_label
         self.tokens = tokens
         self.labels = labels
         self.code_vocab = code_vocab
@@ -38,11 +40,16 @@ class ImageTokenDataset(Dataset):
 
     def __getitem__(self, index):
         codes = self.tokens[index].long()
-        seq_len = codes.shape[0] + 1
-        input_ids = torch.cat([
-            (self.labels[index].long() + self.code_vocab).view(1),
-            codes,
-        ])
+        if self.prepend_label:
+            input_ids = torch.cat([
+                (self.labels[index].long() + self.code_vocab).view(1),
+                codes,
+            ])
+        else:
+            # Text sequences already carry their own leading token, and every id
+            # has to stay inside the model's vocabulary.
+            input_ids = codes
+        seq_len = input_ids.shape[0]
         high = seq_len - 1
         starts = torch.randperm(high)[:self.num_completions] + 1
         if starts.numel() < self.num_completions:  # very short sequences
@@ -82,7 +89,7 @@ class ImageTokenDataModule(LightningDataModule):
 
     def __init__(self, data_path: str | Path, train_completion_len: int,
                  num_completions: int, batch_size: int, code_vocab: int = 16384,
-                 val_split: int = 256, **kwargs):
+                 val_split: int = 256, prepend_label: bool = True, **kwargs):
         super().__init__()
         self.data_path = Path(data_path)
         self.train_completion_len = train_completion_len
@@ -90,6 +97,7 @@ class ImageTokenDataModule(LightningDataModule):
         self.batch_size = batch_size
         self.code_vocab = code_vocab
         self.val_split = val_split
+        self.prepend_label = prepend_label
         self.kwargs = kwargs
         self.datasets = {}
 
@@ -102,7 +110,8 @@ class ImageTokenDataModule(LightningDataModule):
 
         def make(lo, hi):
             return ImageTokenDataset(tokens[lo:hi], labels[lo:hi], self.code_vocab,
-                                     self.num_completions, self.train_completion_len)
+                                     self.num_completions, self.train_completion_len,
+                                     prepend_label=self.prepend_label)
 
         self.datasets = {"val": make(0, split), "train": make(split, tokens.shape[0])}
 
