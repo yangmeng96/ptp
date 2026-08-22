@@ -30,7 +30,7 @@ def _flex(query, key, value, block_mask):
 
     HuggingFace's own integration does the same thing, and `ptp.attention` is
     written to keep the mask shapes fixed so the Triton kernel is compiled once.
-    Measured here: 11.5 s/step eager against 1.5 s/step compiled.
+    Measured here: 11.5 s/step eager against 2.9 s/step compiled.
     """
     global _COMPILED_FLEX
     if _COMPILED_FLEX is None:
