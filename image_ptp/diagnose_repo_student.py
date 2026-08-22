@@ -22,7 +22,13 @@ import torch
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--llamagen-root", type=str, required=True)
+    p.add_argument("--backbone", type=str, default="llamagen",
+                   choices=["llamagen", "vqvae_ar"])
+    p.add_argument("--llamagen-root", type=str, default=None)
+    p.add_argument("--ar-ckpt", type=str, default=None,
+                   help="ptp-vqvae AR checkpoint, for backbone=vqvae_ar")
+    p.add_argument("--code-vocab", type=int, default=16384)
+    p.add_argument("--prepend-label", type=int, default=1)
     p.add_argument("--gpt-model", type=str, default="GPT-B")
     p.add_argument("--gpt-ckpt", type=str, default=None)
     p.add_argument("--data", type=str, required=True)
@@ -44,28 +50,39 @@ def main():
     torch.set_grad_enabled(False)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    from image_ptp.llamagen_hf import build
     from image_ptp.image_data import ImageTokenDataModule
     from ptp.transformer import MixedTransformerModel
     from ptp.lit import ParallelSamplingLightningModule
 
-    root = Path(args.llamagen_root).expanduser()
-    gpt_ckpt = args.gpt_ckpt or str(root / "pretrained_models/c2i_B_256.pt")
-    inner, seq_len = build(root, args.gpt_model, gpt_ckpt,
-                           dtype=torch.float32, device=device)
+    if args.backbone == "llamagen":
+        from image_ptp.llamagen_hf import build
+        root = Path(args.llamagen_root).expanduser()
+        gpt_ckpt = args.gpt_ckpt or str(root / "pretrained_models/c2i_B_256.pt")
+        inner, _ = build(root, args.gpt_model, gpt_ckpt,
+                         dtype=torch.float32, device=device)
+        targets = ["wqkv", "wo", "w1", "w2", "w3"]
+    else:
+        from image_ptp.vqvae_ar_hf import build_module
+        inner = build_module(args.ar_ckpt, device=device, dtype=torch.float32)
+        targets = ["q_proj", "k_proj", "v_proj", "o_proj", "linear1", "linear2"]
+
+    # A full-finetune checkpoint has no adapter tensors; adding LoRA here would
+    # leave the loaded weights sitting under the wrong keys.
+    state_peek = torch.load(Path(args.ckpt).expanduser(), map_location="cpu",
+                            weights_only=False)["state_dict"]
+    has_lora = any("lora_" in k for k in state_peek)
     model = MixedTransformerModel(
         model_id=inner, dtype=torch.float32,
-        lora_config={"r": args.lora_rank,
-                     "target_modules": ["wqkv", "wo", "w1", "w2", "w3"]},
+        lora_config={"r": args.lora_rank, "target_modules": targets} if has_lora else None,
         attn_implementation="flex_attention",
     ).to(device)
+    print(f"checkpoint is {'LoRA' if has_lora else 'full finetune'}")
     lit = ParallelSamplingLightningModule(
         model=model, optim_cfg={"lr": 1e-4, "lr_warmup": 10},
         top_k=args.top_k, top_p=args.top_p, temperature=1.0,
     ).to(device)
 
-    state = torch.load(Path(args.ckpt).expanduser(), map_location="cpu",
-                       weights_only=False)["state_dict"]
+    state = state_peek
     missing, unexpected = lit.load_state_dict(state, strict=False)
     trained = [k for k in state if "lora_" in k or "u_embed" in k]
     print(f"loaded {len(state)} tensors ({len(trained)} adapter/auxiliary), "
@@ -73,7 +90,9 @@ def main():
     lit.eval()
 
     dm = ImageTokenDataModule(args.data, args.completion_len,
-                              args.num_completions, args.batch_size)
+                              args.num_completions, args.batch_size,
+                              code_vocab=args.code_vocab,
+                              prepend_label=bool(args.prepend_label))
     dm.setup()
 
     def run(shuffle_u):
