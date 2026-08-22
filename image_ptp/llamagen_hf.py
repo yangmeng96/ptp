@@ -136,6 +136,17 @@ class LlamaGenForCausalLM(nn.Module):
             table = self.gpt.freqs_cis = table.to(device)
         freqs = table[position_ids.clamp(min=0, max=table.shape[0] - 1)]
 
+        # A cached continuation of more than one position needs its causal mask
+        # spelled out: the queries are shorter than the keys, so SDPA's
+        # `is_causal` aligns to the wrong corner and the new positions would see
+        # each other's future. Callers that pass a mask already handle this.
+        if attention_mask is None and past_key_values is not None:
+            cached = past_key_values.get_seq_length()
+            if cached and seqlen > 1:
+                q_pos = torch.arange(seqlen, device=device) + cached
+                k_pos = torch.arange(cached + seqlen, device=device)
+                attention_mask = (k_pos[None, :] <= q_pos[:, None])[None, None]
+
         for layer_idx, block in enumerate(self.gpt.layers):
             h = h + block.drop_path(self._attend(
                 block.attention, block.attention_norm(h), freqs, attention_mask,
