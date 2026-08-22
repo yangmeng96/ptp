@@ -30,6 +30,8 @@ def parse_args():
     p.add_argument("--students", type=str, nargs="*", default=[],
                    help="name=path entries; the checkpoint tells us LoRA from full")
     p.add_argument("--lora-rank", type=int, default=32)
+    p.add_argument("--num-layers", type=int, default=None,
+                   help="student depth, when it differs from the teacher's")
     p.add_argument("--num-images", type=int, default=10)
     p.add_argument("--block-len", type=int, default=7)
     p.add_argument("--temperature", type=float, default=1.0,
@@ -131,7 +133,8 @@ def main():
         state = torch.load(Path(path).expanduser(), map_location="cpu",
                            weights_only=False)["state_dict"]
         has_lora = any("lora_" in k for k in state)
-        inner = build_module(args.ar_ckpt, device=device, dtype=torch.float32)
+        inner = build_module(args.ar_ckpt, device=device, dtype=torch.float32,
+                             num_layers=args.num_layers)
         mixed = MixedTransformerModel(
             model_id=inner, dtype=torch.float32,
             lora_config={"r": args.lora_rank, "target_modules": targets} if has_lora else None,
