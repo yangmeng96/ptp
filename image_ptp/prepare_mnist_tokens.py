@@ -1,4 +1,16 @@
-"""Encode MNIST into VQ-VAE code sequences, in the format the data module reads.
+"""Encode MNIST into VQ-VAE code sequences and cache the teacher's bin edges.
+
+The edges are the important part. `ptp.transformer` recovers the teacher by
+switching LoRA adapters off, so with no adapters present -- a full finetune --
+`ar_forward` returns the weights currently being trained and the run silently
+becomes self-distillation against a moving target. Measured on the first
+attempt: 47% of bins had drifted more than half their own width away from the
+frozen teacher's.
+
+Computing the edges here from a genuinely frozen teacher and passing them
+through the batch takes `ptp.lit` down its `bin_edges_left`/`bin_edges_right`
+path, which skips `predict_bin_edges` entirely. No repo changes needed, and
+full finetune becomes a real distillation again.
 
 Written to match `image_ptp/pregenerate.py`'s output so `ImageTokenDataModule`
 serves both without a special case. The BOS token takes the slot the class label
@@ -40,6 +52,8 @@ def main():
     from models.ar import codes_flat_to_seq
     from utils.helper import load_vqvae
     from torchvision import datasets
+    sys.path.insert(0, "/home/mengy13/ptp")
+    from image_ptp.vqvae_ar_hf import build
 
     torch.set_grad_enabled(False)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -60,8 +74,42 @@ def main():
         chunks.append(codes_flat_to_seq(vqvae.encode(images), perm).cpu())
     tokens = torch.cat(chunks)
 
+    # Bin edges from the frozen teacher, laid out the way ptp.lit reads them:
+    # entry j belongs to input_ids[j+1], so the array is one shorter than the
+    # sequence fed to the model.
+    teacher, _ = build(args.teacher_ckpt, device=device, dtype=torch.float32)
+    lefts, rights = [], []
+    for start in range(0, tokens.shape[0], args.batch_size):
+        chunk = tokens[start:start + args.batch_size].long().to(device)
+        ids = torch.cat([torch.full((chunk.shape[0], 1), num_codes, device=device), chunk], 1)
+        probs = torch.softmax(teacher(input_ids=ids).logits[:, :-1].float(), dim=-1)
+        cdf = probs.cumsum(-1)
+        target = chunk.unsqueeze(-1)
+        right = cdf.gather(2, target).squeeze(2)
+        lefts.append((right - probs.gather(2, target).squeeze(2)).cpu())
+        rights.append(right.cpu())
+    left, right = torch.cat(lefts), torch.cat(rights)
+    width = right - left
+    print(f"bin width: median={width.median():.4f} mean={width.mean():.4f} "
+          f"min={width.min():.2e}")
+
+    # An interval is only meaningful if drawing u inside it and inverting the
+    # teacher's CDF gives the token back. Check before anything trains on it.
+    probe = slice(0, min(256, tokens.shape[0]))
+    chunk = tokens[probe].long().to(device)
+    ids = torch.cat([torch.full((chunk.shape[0], 1), num_codes, device=device), chunk], 1)
+    cdf = torch.softmax(teacher(input_ids=ids).logits[:, :-1].float(), -1).cumsum(-1)
+    u = (left[probe].to(device) + width[probe].to(device)
+         * torch.rand(chunk.shape, device=device))
+    recovered = torch.searchsorted(cdf.contiguous(), u.unsqueeze(-1).contiguous()).squeeze(-1)
+    rate = (recovered == chunk).float().mean().item()
+    print(f"oracle inverse-CDF recovers the true token: {rate:.4f}")
+    assert rate > 0.99, "bin edges do not describe this teacher"
+
     payload = {
         "tokens": tokens.to(torch.int32),
+        "left_bin_edges": left,
+        "right_bin_edges": right,
         # Zero labels, so the data module emits BOS = 0 + code_vocab.
         "labels": torch.zeros(tokens.shape[0], dtype=torch.int32),
         "config": {
