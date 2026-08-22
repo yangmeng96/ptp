@@ -29,6 +29,9 @@ def parse_args():
                    help="ptp-vqvae AR checkpoint, for backbone=vqvae_ar")
     p.add_argument("--code-vocab", type=int, default=16384)
     p.add_argument("--prepend-label", type=int, default=1)
+    p.add_argument("--adapter-name", type=str, default="linear_interpolation",
+                   help="must match the trained checkpoint, or its u embedding "
+                        "silently fails to load and the lift reads as 1.0")
     p.add_argument("--gpt-model", type=str, default="GPT-B")
     p.add_argument("--gpt-ckpt", type=str, default=None)
     p.add_argument("--data", type=str, required=True)
@@ -74,6 +77,7 @@ def main():
     model = MixedTransformerModel(
         model_id=inner, dtype=torch.float32,
         lora_config={"r": args.lora_rank, "target_modules": targets} if has_lora else None,
+        adapter_name=args.adapter_name,
         attn_implementation="flex_attention",
     ).to(device)
     print(f"checkpoint is {'LoRA' if has_lora else 'full finetune'}")
@@ -87,6 +91,12 @@ def main():
     trained = [k for k in state if "lora_" in k or "u_embed" in k]
     print(f"loaded {len(state)} tensors ({len(trained)} adapter/auxiliary), "
           f"{len(missing)} missing, {len(unexpected)} unexpected")
+    # A mismatched adapter_name leaves the auxiliary embedding at its random
+    # initialisation, which reads as a lift of exactly 1.0 -- the same signature
+    # as a student that ignores u. Refuse to report that as a result.
+    stale = [k for k in missing if "u_embed" in k] + [k for k in unexpected if "u_embed" in k]
+    assert not stale, (f"u embedding did not load: {stale[:3]}. "
+                       f"Pass --adapter-name matching the checkpoint.")
     lit.eval()
 
     dm = ImageTokenDataModule(args.data, args.completion_len,
