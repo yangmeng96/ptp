@@ -69,33 +69,44 @@ def apply_gated_lora(module, rank, alpha, targets=LORA_TARGETS):
     return wrapped
 
 
-class BinaryFloatEmbedding(nn.Module):
-    """embed(u) = W binary(u) + b, with binary(u) the 32 bits of the float32.
+class AuxiliaryEmbedding(nn.Module):
+    """The PTP repo's auxiliary embedding, rescaled onto the token shell.
 
-    This is the scheme the PTP paper reports (Eq. 16). Bit-level input gives the
-    network access to arbitrarily fine distinctions between nearby u, which
-    matters here because image bins are narrow.
+    The paper prints the binary scheme (Eq. 16) but none of the released configs
+    override `adapter_name`, so every published checkpoint in fact used
+    `linear_interpolation` -- a piecewise-linear blend of three learned vectors,
+    which is smooth in u where the bit pattern of a float32 is not. Use the
+    repo's module rather than a reimplementation; it is plain PyTorch with no
+    HuggingFace dependency.
 
-    The output is projected onto the shell the token embeddings occupy. A
-    pretrained backbone forms its queries from whatever sits in the residual
-    stream, so an auxiliary vector of the wrong magnitude produces queries far
-    outside the distribution its attention was trained on -- it stops reading
-    the prefix at all. Default `nn.Linear` init on 32 binary inputs lands around
-    norm 12 against token embeddings at 0.94, which is enough to break it.
-    Those embeddings sit at near-constant norm, so matching that shell is the
-    natural target; `scale` stays learnable in case it is not exactly right.
+    The rescaling is ours. A pretrained backbone builds its queries from
+    whatever sits in the residual stream, so an auxiliary vector of the wrong
+    magnitude yields queries far outside the distribution the attention was
+    trained on and the slot stops reading the prefix. Token embeddings here sit
+    at near-constant norm (0.940 +/- 0.035), which makes that shell the natural
+    target; `scale` is learnable in case it is not quite right.
     """
 
-    def __init__(self, dim, target_norm=1.0):
+    def __init__(self, dim, target_norm=1.0, adapter_name="linear_interpolation",
+                 adapter_kwargs=None, rescale=True):
         super().__init__()
-        self.proj = nn.Linear(32, dim)
+        from ptp import auxiliary_embed as repo_embed
+
+        cls = {
+            "linear_interpolation": "LinearInterpolationEmbedding",
+            "binary": "BinaryFloatEmbedding",
+            "sawtooth": "SawtoothFloatEmbedding",
+            "quarter_cos": "QuarterCosEmbedding",
+            "round": "RoundingEmbedding",
+        }[adapter_name]
+        self.inner = getattr(repo_embed, cls)(dim, **(adapter_kwargs or {}))
+        self.rescale = rescale
         self.scale = nn.Parameter(torch.tensor(float(target_norm)))
 
     def forward(self, u):
-        bits = u.to(torch.float32).view(torch.int32)
-        masks = 2 ** torch.arange(31, -1, -1, device=u.device, dtype=torch.int32)
-        expanded = ((bits[..., None] & masks) != 0).to(self.proj.weight.dtype)
-        out = self.proj(expanded)
+        out = self.inner(u)
+        if not self.rescale:
+            return out
         return out / out.norm(dim=-1, keepdim=True).clamp(min=1e-6) * self.scale
 
 
@@ -124,7 +135,8 @@ class LlamaGenPTP(nn.Module):
     plays both roles -- disable the adapters and the model is the teacher again.
     """
 
-    def __init__(self, gpt, lora_rank=128, lora_alpha=None, lora_dropout=0.0):
+    def __init__(self, gpt, lora_rank=128, lora_alpha=None, lora_dropout=0.0,
+                 adapter_name="linear_interpolation", rescale_u=True):
         super().__init__()
         self.config = gpt.config
         self.cls_token_num = gpt.cls_token_num
@@ -137,7 +149,9 @@ class LlamaGenPTP(nn.Module):
         self.base = gpt
         self.lora_layers = apply_gated_lora(
             gpt, lora_rank, lora_alpha if lora_alpha is not None else lora_rank)
-        self.u_embed = BinaryFloatEmbedding(self.config.dim, target_norm=token_norm)
+        self.u_embed = AuxiliaryEmbedding(
+            self.config.dim, target_norm=token_norm,
+            adapter_name=adapter_name, rescale=rescale_u)
 
     def set_gate(self, gate):
         """Positions where the low-rank update applies; None disables it entirely."""
