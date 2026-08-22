@@ -44,12 +44,16 @@ def main():
     ckpt = args.gpt_ckpt or str(
         Path(args.llamagen_root).expanduser() / "pretrained_models/c2i_B_256.pt")
     inner, seq_len = build(Path(args.llamagen_root).expanduser(), args.gpt_model,
-                           ckpt, dtype=torch.bfloat16, device=device)
+                           ckpt, dtype=torch.float32, device=device)
     print(f"wrapped LlamaGen: seq_len={seq_len}, hidden={inner.config.hidden_size}")
 
+    # Master weights in fp32 with autocast around the step, which is what the
+    # repo's `precision: bf16-mixed` gives it. Passing a module skips the dtype
+    # handling in TransformerModel, so the auxiliary embedding would otherwise
+    # stay fp32 against bf16 weights.
     model = MixedTransformerModel(
         model_id=inner,
-        dtype=torch.bfloat16,
+        dtype=torch.float32,
         lora_config={"r": args.lora_rank,
                      "target_modules": ["wqkv", "wo", "w1", "w2", "w3"]},
         attn_implementation="flex_attention",
@@ -74,7 +78,8 @@ def main():
     losses = []
     for step, batch in zip(range(args.steps), loader):
         batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
-        metrics = lit.forward(batch)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            metrics = lit.forward(batch)
         loss = metrics["loss"]
         opt.zero_grad(set_to_none=True)
         loss.backward()
