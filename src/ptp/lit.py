@@ -31,7 +31,8 @@ class ParallelSamplingLightningModule(LightningModule):
                  temperature: float | None = None,
                  top_k: int | None = None,
                  top_p: float | None = None,
-                 hist_base: list[float] | None = None):
+                 hist_base: list[float] | None = None,
+                 checkpoint_save_mode: str = 'full'):
         if pbar_metrics is None:
             pbar_metrics = ['correct']
             if completion_loss_weight > 0.0:
@@ -55,6 +56,11 @@ class ParallelSamplingLightningModule(LightningModule):
         self.top_k = top_k
         self.top_p = top_p
         self.hist_base = torch.tensor(hist_base, dtype=torch.float64) if hist_base is not None else None
+        # `on_save_checkpoint` reads this but nothing ever set it, so the first
+        # checkpoint save raised AttributeError and killed the run. 'full' keeps
+        # the released behaviour of writing the whole state dict; 'adapter_only'
+        # selects the trimmed path that `_adapter_state_dict` was written for.
+        self.checkpoint_save_mode = checkpoint_save_mode
         self._hist_accumulator: list[torch.Tensor] = []
 
     def configure_model(self) -> None:
