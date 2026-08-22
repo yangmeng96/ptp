@@ -268,7 +268,7 @@ def main():
             (out_dir / "history.json").write_text(json.dumps(history, indent=2))
 
     torch.save({
-        "lora": {k: v for k, v in model.state_dict().items() if "lora" in k},
+        "lora": model.lora_state_dict(),
         "u_embed": model.u_embed.state_dict(),
         "args": vars(args), "data_config": cfg,
     }, out_dir / "student.pt")

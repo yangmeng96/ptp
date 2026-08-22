@@ -18,7 +18,55 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-LORA_TARGETS = ["wqkv", "wo", "w1", "w2", "w3"]
+LORA_TARGETS = ("wqkv", "wo", "w1", "w2", "w3")
+
+
+class GatedLoRALinear(nn.Module):
+    """A frozen linear with a low-rank update applied only at gated positions.
+
+    PTP keeps the prefix on the pure base model and adapts only the auxiliary
+    slots: the reference implementation runs the prefix with adapters disabled
+    to build the KV cache, then enables them for the completion, and at
+    inference subtracts the update back off the token positions. Applying the
+    update everywhere instead perturbs the very context the auxiliary slots read
+    -- measured here as the base model's own next-token accuracy dropping from
+    0.414 to 0.352 after training.
+
+    `gate` is a per-position mask set on the module before each forward.
+    """
+
+    gate: torch.Tensor | None = None
+
+    def __init__(self, base: nn.Linear, rank: int, alpha: float):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        self.lora_a = nn.Linear(base.in_features, rank, bias=False)
+        self.lora_b = nn.Linear(rank, base.out_features, bias=False)
+        nn.init.kaiming_uniform_(self.lora_a.weight, a=5 ** 0.5)
+        nn.init.zeros_(self.lora_b.weight)
+        self.scaling = alpha / rank
+
+    def forward(self, x):
+        y = self.base(x)
+        if self.gate is None:
+            return y
+        delta = self.lora_b(self.lora_a(x)) * self.scaling
+        return y + delta * self.gate.to(delta.dtype).view(1, -1, 1)
+
+
+def apply_gated_lora(module, rank, alpha, targets=LORA_TARGETS):
+    """Replace the target linears in place, returning the wrappers."""
+    wrapped = []
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear) and name in targets:
+            layer = GatedLoRALinear(child, rank, alpha)
+            setattr(module, name, layer)
+            wrapped.append(layer)
+        else:
+            wrapped += apply_gated_lora(child, rank, alpha, targets)
+    return wrapped
 
 
 class BinaryFloatEmbedding(nn.Module):
@@ -78,8 +126,6 @@ class LlamaGenPTP(nn.Module):
 
     def __init__(self, gpt, lora_rank=128, lora_alpha=None, lora_dropout=0.0):
         super().__init__()
-        from peft import LoraConfig, get_peft_model
-
         self.config = gpt.config
         self.cls_token_num = gpt.cls_token_num
         self.num_classes = gpt.num_classes
@@ -88,32 +134,26 @@ class LlamaGenPTP(nn.Module):
         for p in gpt.parameters():
             p.requires_grad_(False)
         token_norm = gpt.tok_embeddings.weight.detach().float().norm(dim=1).mean().item()
-        self.gpt = get_peft_model(gpt, LoraConfig(
-            r=lora_rank,
-            lora_alpha=lora_alpha if lora_alpha is not None else lora_rank,
-            lora_dropout=lora_dropout,
-            target_modules=LORA_TARGETS,
-            bias="none",
-        ))
+        self.base = gpt
+        self.lora_layers = apply_gated_lora(
+            gpt, lora_rank, lora_alpha if lora_alpha is not None else lora_rank)
         self.u_embed = BinaryFloatEmbedding(self.config.dim, target_norm=token_norm)
 
-    @property
-    def base(self):
-        """The underlying LlamaGen module, past the PEFT wrapper."""
-        return self.gpt.base_model.model
+    def set_gate(self, gate):
+        """Positions where the low-rank update applies; None disables it entirely."""
+        for layer in self.lora_layers:
+            layer.gate = gate
 
     @contextmanager
     def adapters(self, enabled):
-        from peft.tuners.tuners_utils import BaseTunerLayer
-        for module in self.gpt.modules():
-            if isinstance(module, BaseTunerLayer):
-                module.enable_adapters(enabled)
+        saved = [layer.gate for layer in self.lora_layers]
+        if not enabled:
+            self.set_gate(None)
         try:
             yield
         finally:
-            for module in self.gpt.modules():
-                if isinstance(module, BaseTunerLayer):
-                    module.enable_adapters(True)
+            for layer, gate in zip(self.lora_layers, saved):
+                layer.gate = gate
 
     def _freqs(self, positions):
         base = self.base
@@ -205,8 +245,14 @@ class LlamaGenPTP(nn.Module):
             torch.arange(start, start + block_len, device=device),
         ])
         length = prefix_len + block_len
-        logits = self._run(embeds, positions,
-                           self._causal_mask(length, embeds.shape[0], device))
+        gate = torch.zeros(length, dtype=torch.bool, device=device)
+        gate[prefix_len:] = True
+        self.set_gate(gate)
+        try:
+            logits = self._run(embeds, positions,
+                               self._causal_mask(length, embeds.shape[0], device))
+        finally:
+            self.set_gate(None)
         return logits[:, prefix_len:]
 
     def student_logits(self, cond, tokens, u_block, start):
@@ -217,6 +263,9 @@ class LlamaGenPTP(nn.Module):
         """
         return self.block_forward(cond, tokens[:, :start],
                                   self.u_embed(u_block), start)
+
+    def lora_state_dict(self):
+        return {k: v for k, v in self.state_dict().items() if "lora_" in k}
 
     def trainable_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]
