@@ -187,14 +187,25 @@ class ARForCausalLM(nn.Module):
                             past_key_values=past_key_values)
 
 
-def build(ar_ckpt, device="cuda", dtype=torch.float32):
-    """Load an `ar_*.pt` checkpoint from ptp-vqvae into the wrapper."""
+def build(ar_ckpt, device="cuda", dtype=torch.float32, num_layers=None):
+    """Load an `ar_*.pt` checkpoint from ptp-vqvae into the wrapper.
+
+    `num_layers` may exceed the checkpoint's depth to give the student more
+    capacity than the teacher, which it needs: the student has to reproduce the
+    teacher's distribution *and* invert it against u, for several positions at
+    once without seeing the tokens in between. The extra layers are copies of
+    the teacher's, cycled, so the student starts out able to model the sequence
+    and spends its new capacity on the inversion rather than relearning the
+    task. Only meaningful when the bin edges come from a separate frozen
+    teacher -- otherwise the student is its own teacher and depth is moot.
+    """
     if isinstance(dtype, str):
         dtype = getattr(torch, dtype)
     ckpt = torch.load(ar_ckpt, map_location="cpu", weights_only=False)
+    depth = num_layers or ckpt["num_layers"]
     model = ARForCausalLM(
         num_codes=ckpt["num_codes"], d_model=ckpt["d_model"], n_head=ckpt["nhead"],
-        num_layers=ckpt["num_layers"], dim_feedforward=ckpt["dim_feedforward"],
+        num_layers=depth, dim_feedforward=ckpt["dim_feedforward"],
         max_seq_len=ckpt["max_seq_len"],
     )
     state = ckpt["ar"]
@@ -203,9 +214,12 @@ def build(ar_ckpt, device="cuda", dtype=torch.float32):
     model.lm_head.weight.data.copy_(state["lm_head.weight"])
     model.lm_head.bias.data.copy_(state["lm_head.bias"])
     for i, layer in enumerate(model.layers):
-        layer.load_encoder_layer(state, f"encoder.layers.{i}")
+        layer.load_encoder_layer(state, f"encoder.layers.{i % ckpt['num_layers']}")
+    if depth != ckpt["num_layers"]:
+        print(f"student depth {depth} from a {ckpt['num_layers']}-layer teacher "
+              f"(layers cycled)")
     return model.to(device=device, dtype=dtype).eval(), ckpt
 
 
-def build_module(ar_ckpt, device="cuda", dtype=torch.float32):
-    return build(ar_ckpt, device=device, dtype=dtype)[0]
+def build_module(ar_ckpt, device="cuda", dtype=torch.float32, num_layers=None):
+    return build(ar_ckpt, device=device, dtype=dtype, num_layers=num_layers)[0]
