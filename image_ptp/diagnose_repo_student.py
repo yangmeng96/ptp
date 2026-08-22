@@ -86,8 +86,14 @@ def main():
         top_k=args.top_k, top_p=args.top_p, temperature=1.0,
     ).to(device)
 
-    state = state_peek
-    missing, unexpected = lit.load_state_dict(state, strict=False)
+    # Load into the inner model, not the LightningModule. Its `load_state_dict`
+    # rewrites any ".u_adapter." in a key to ".u_embed.", which is presumably
+    # legacy-name handling -- but BinaryFloatEmbedding's parameter is literally
+    # named `u_adapter`, so the rewrite renames it to something the model does
+    # not have and the auxiliary embedding is silently dropped. A checkpoint
+    # loaded that way reports a lift of exactly 1.0 while looking healthy.
+    state = {k[len("model."):]: v for k, v in state_peek.items() if k.startswith("model.")}
+    missing, unexpected = model.load_state_dict(state, strict=False)
     trained = [k for k in state if "lora_" in k or "u_embed" in k]
     print(f"loaded {len(state)} tensors ({len(trained)} adapter/auxiliary), "
           f"{len(missing)} missing, {len(unexpected)} unexpected")
