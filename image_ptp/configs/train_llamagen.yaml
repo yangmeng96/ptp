@@ -1,0 +1,51 @@
+# O-PTP on LlamaGen GPT-B, driven by the unmodified ptp_train entry point.
+#
+# The model is LlamaGen behind a HuggingFace-shaped wrapper, so
+# ptp.transformer.MixedTransformerModel takes it as a plain nn.Module and every
+# PTP-specific detail -- the auxiliary embedding, the position shift, the gated
+# LoRA, the nested completions, the Beta-sampled u -- comes from the repo.
+#
+# No classifier-free guidance here. It costs nothing in bin width once top-k is
+# applied (0.0149 unguided against 0.0151 at cfg 4, measured at top-k 100), and
+# supporting it would mean changing ptp.lit, which is the thing this setup
+# exists to avoid.
+training:
+  n_steps: 20000
+  precision: bf16-mixed
+  eval_every_steps: 1000
+  wandb_project: offline
+  check_point_interval:
+    minutes: 30
+
+model:
+  _target_: ptp.lit.ParallelSamplingLightningModule
+  optim_cfg:
+    lr: 0.0001
+    lr_warmup: 500
+  # Truncation is applied to the teacher before the bin edges are read, so the
+  # intervals describe the distribution that is actually sampled from.
+  top_k: 100
+  top_p: 0.999
+  temperature: 1.0
+  model:
+    _target_: ptp.transformer.MixedTransformerModel
+    dtype: bfloat16
+    model_id:
+      _target_: image_ptp.llamagen_hf.build_module
+      llamagen_root: ${oc.env:LLAMAGEN_ROOT}
+      gpt_model: GPT-B
+      gpt_ckpt: ${oc.env:LLAMAGEN_ROOT}/pretrained_models/c2i_B_256.pt
+      image_size: 256
+    lora_config:
+      r: 128
+      target_modules: [wqkv, wo, w1, w2, w3]
+
+data:
+  _target_: image_ptp.image_data.ImageTokenDataModule
+  data_path: ${oc.env:PTP_IMAGE_DATA}
+  # 128 completions per sequence is the whole point of using the repo's data
+  # path: one forward supervises 128 x 16 positions instead of 16.
+  num_completions: 128
+  train_completion_len: 16
+  batch_size: 4
+  num_workers: 4

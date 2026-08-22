@@ -200,3 +200,11 @@ def build(llamagen_root, gpt_model="GPT-B", gpt_ckpt=None, image_size=256,
             gpt.config.rope_base, cls_token_num)
     gpt.eval()
     return LlamaGenForCausalLM(gpt, apply_rotary_emb), seq_len
+
+
+def build_module(llamagen_root, gpt_model="GPT-B", gpt_ckpt=None, image_size=256,
+                 **kwargs):
+    """Return just the model, for configs that instantiate it by target."""
+    model, _ = build(llamagen_root, gpt_model=gpt_model, gpt_ckpt=gpt_ckpt,
+                     image_size=image_size, **kwargs)
+    return model
