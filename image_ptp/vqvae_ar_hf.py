@@ -46,10 +46,15 @@ def _flex(query, key, value, block_mask):
             if _COMPILED_FLEX is None:
                 _COMPILED_FLEX = torch.compile(flex_attention, dynamic=False)
             return _COMPILED_FLEX(query, key, value, block_mask=block_mask)
-        except Exception as exc:
+        except Exception:
             _COMPILE_FAILED = True
-            print(f"flex_attention compile unavailable, falling back to eager: "
-                  f"{type(exc).__name__}")
+            # Print the whole traceback. Reporting only the exception type hides
+            # exactly what is needed to tell a backend limitation apart from a
+            # bug in the caller, and the two call for opposite responses.
+            import traceback
+            print("flex_attention compile failed; falling back to eager. "
+                  "Full traceback follows:")
+            traceback.print_exc()
     return flex_attention(query, key, value, block_mask=block_mask)
 
 
