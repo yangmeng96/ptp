@@ -29,13 +29,28 @@ from torch import nn
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 _COMPILED_FLEX = None
+_COMPILE_FAILED = False
 
 
 def _flex(query, key, value, block_mask):
-    global _COMPILED_FLEX
-    if _COMPILED_FLEX is None:
-        _COMPILED_FLEX = torch.compile(flex_attention, dynamic=False)
-    return _COMPILED_FLEX(query, key, value, block_mask=block_mask)
+    """Compiled flex_attention where the backend accepts it, eager where it does not.
+
+    Inductor raises `IndexError: map::at` on this model's 32-wide heads. The
+    sequences here are 49 tokens against LlamaGen's 256, so the eager path costs
+    little -- unlike on the larger model, where compiling took a step from 11.5s
+    to 2.9s and is worth insisting on.
+    """
+    global _COMPILED_FLEX, _COMPILE_FAILED
+    if not _COMPILE_FAILED:
+        try:
+            if _COMPILED_FLEX is None:
+                _COMPILED_FLEX = torch.compile(flex_attention, dynamic=False)
+            return _COMPILED_FLEX(query, key, value, block_mask=block_mask)
+        except Exception as exc:
+            _COMPILE_FAILED = True
+            print(f"flex_attention compile unavailable, falling back to eager: "
+                  f"{type(exc).__name__}")
+    return flex_attention(query, key, value, block_mask=block_mask)
 
 
 @dataclass
