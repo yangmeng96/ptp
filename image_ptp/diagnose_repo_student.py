@@ -29,6 +29,8 @@ def parse_args():
                    help="ptp-vqvae AR checkpoint, for backbone=vqvae_ar")
     p.add_argument("--code-vocab", type=int, default=16384)
     p.add_argument("--prepend-label", type=int, default=1)
+    p.add_argument("--num-layers", type=int, default=None,
+                   help="student depth, when it differs from the teacher's")
     p.add_argument("--adapter-name", type=str, default="linear_interpolation",
                    help="must match the trained checkpoint, or its u embedding "
                         "silently fails to load and the lift reads as 1.0")
@@ -66,7 +68,8 @@ def main():
         targets = ["wqkv", "wo", "w1", "w2", "w3"]
     else:
         from image_ptp.vqvae_ar_hf import build_module
-        inner = build_module(args.ar_ckpt, device=device, dtype=torch.float32)
+        inner = build_module(args.ar_ckpt, device=device, dtype=torch.float32,
+                             num_layers=args.num_layers)
         targets = ["q_proj", "k_proj", "v_proj", "o_proj", "linear1", "linear2"]
 
     # A full-finetune checkpoint has no adapter tensors; adding LoRA here would
