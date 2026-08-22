@@ -22,6 +22,21 @@ import torch
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
+_COMPILED_FLEX = None
+
+
+def _flex(query, key, value, block_mask):
+    """flex_attention is meant to be compiled; eager it costs an order of magnitude.
+
+    HuggingFace's own integration does the same thing, and `ptp.attention` is
+    written to keep the mask shapes fixed so the Triton kernel is compiled once.
+    Measured here: 11.5 s/step eager against 1.5 s/step compiled.
+    """
+    global _COMPILED_FLEX
+    if _COMPILED_FLEX is None:
+        _COMPILED_FLEX = torch.compile(flex_attention, dynamic=False)
+    return _COMPILED_FLEX(query, key, value, block_mask=block_mask)
+
 
 @dataclass
 class LlamaGenHFConfig:
@@ -103,7 +118,7 @@ class LlamaGenForCausalLM(nn.Module):
         v = v.repeat_interleave(repeat, dim=1)
 
         if isinstance(mask, BlockMask):
-            out = flex_attention(q, k, v, block_mask=mask)
+            out = _flex(q, k, v, mask)
         else:
             out = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask,
