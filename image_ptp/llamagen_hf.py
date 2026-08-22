@@ -25,7 +25,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 @dataclass
 class LlamaGenHFConfig:
-    """The handful of fields the PTP code reads off `model.config`."""
+    """The fields the PTP code and PEFT read off `model.config`."""
     hidden_size: int
     vocab_size: int
     num_attention_heads: int
@@ -33,6 +33,10 @@ class LlamaGenHFConfig:
     code_vocab: int
     num_classes: int
     cls_token_num: int
+    # PEFT branches on this to special-case a few architectures; naming one that
+    # needs no special-casing keeps it on the generic path.
+    model_type: str = "llama"
+    tie_word_embeddings: bool = False
 
 
 @dataclass
