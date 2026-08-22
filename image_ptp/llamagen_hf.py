@@ -198,6 +198,8 @@ def build(llamagen_root, gpt_model="GPT-B", gpt_ckpt=None, image_size=256,
     sys.path.insert(0, str(llamagen_root))
     from autoregressive.models.gpt import GPT_models, precompute_freqs_cis_2d, apply_rotary_emb
 
+    if isinstance(dtype, str):
+        dtype = getattr(torch, dtype)  # yaml hands this over as a name
     seq_len = (image_size // downsample) ** 2
     gpt = GPT_models[gpt_model](
         vocab_size=codebook_size, block_size=seq_len,
