@@ -1,0 +1,46 @@
+# Positive control: O-PTP on the MNIST VQ-VAE teacher, through the PTP repo.
+#
+# The ptp-vqvae project trains a student on these exact weights from scratch and
+# gets a 1.70x lift from the auxiliaries. Reproducing that here shows the
+# pipeline is sound, which the LlamaGen runs cannot establish on their own.
+# This arm is identical to mnist_full except that the base is frozen and
+# adapted by a low-rank update -- the same way the LlamaGen runs were
+# trained. Comparing the two isolates LoRA on a case known to work.
+#
+# The block is 7 tokens, matching ptp-vqvae's default for a 7x7 latent grid.
+training:
+  n_steps: 4000
+  precision: 32-true
+  eval_every_steps: 500
+  wandb_project: ptpimage
+  check_point_interval:
+    minutes: 5
+
+model:
+  _target_: ptp.lit.ParallelSamplingLightningModule
+  optim_cfg:
+    lr: 0.0005
+    lr_warmup: 200
+  # No truncation: ptp-vqvae drew u straight from the teacher softmax, and the
+  # 512-code teacher is already sharp (median bin 0.377).
+  temperature: 1.0
+  model:
+    _target_: ptp.transformer.MixedTransformerModel
+    dtype: float32
+    attn_implementation: flex_attention
+    model_id:
+      _target_: image_ptp.vqvae_ar_hf.build_module
+      ar_ckpt: /home/mengy13/ptp-vqvae/checkpoints/ar_mnist_raster.pt
+      dtype: float32
+    lora_config:
+      r: 32
+      target_modules: [q_proj, k_proj, v_proj, o_proj, linear1, linear2]
+
+data:
+  _target_: image_ptp.image_data.ImageTokenDataModule
+  data_path: /home/mengy13/ptp-image-results/mnist_tokens.pt
+  code_vocab: 512
+  num_completions: 32
+  train_completion_len: 7
+  batch_size: 32
+  num_workers: 4
