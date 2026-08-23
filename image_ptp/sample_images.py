@@ -32,6 +32,9 @@ def parse_args():
     p.add_argument("--lora-rank", type=int, default=32)
     p.add_argument("--num-layers", type=int, default=None,
                    help="student depth, when it differs from the teacher's")
+    p.add_argument("--gated", action="store_true",
+                   help="checkpoint was trained with a frozen prefix pass; "
+                        "sampling it ungated runs a configuration it never saw")
     p.add_argument("--num-images", type=int, default=10)
     p.add_argument("--block-len", type=int, default=7)
     p.add_argument("--temperature", type=float, default=1.0,
@@ -107,6 +110,7 @@ def main():
 
     from image_ptp.vqvae_ar_hf import build, build_module
     from ptp.transformer import MixedTransformerModel
+    from image_ptp.gated_full import GatedFullTransformerModel
 
     teacher, meta = build(args.ar_ckpt, device=device, dtype=torch.float32)
     h, w, bos = meta["h"], meta["w"], meta["num_codes"]
@@ -135,7 +139,8 @@ def main():
         has_lora = any("lora_" in k for k in state)
         inner = build_module(args.ar_ckpt, device=device, dtype=torch.float32,
                              num_layers=args.num_layers)
-        mixed = MixedTransformerModel(
+        model_cls = GatedFullTransformerModel if args.gated else MixedTransformerModel
+        mixed = model_cls(
             model_id=inner, dtype=torch.float32,
             lora_config={"r": args.lora_rank, "target_modules": targets} if has_lora else None,
             attn_implementation="flex_attention",
