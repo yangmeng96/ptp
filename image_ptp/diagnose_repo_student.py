@@ -29,6 +29,9 @@ def parse_args():
                    help="ptp-vqvae AR checkpoint, for backbone=vqvae_ar")
     p.add_argument("--code-vocab", type=int, default=16384)
     p.add_argument("--prepend-label", type=int, default=1)
+    p.add_argument("--gated", action="store_true",
+                   help="checkpoint was trained with a frozen prefix pass; "
+                        "evaluating it ungated runs a configuration it never saw")
     p.add_argument("--num-layers", type=int, default=None,
                    help="student depth, when it differs from the teacher's")
     p.add_argument("--adapter-name", type=str, default="linear_interpolation",
@@ -58,6 +61,8 @@ def main():
     from image_ptp.image_data import ImageTokenDataModule
     from ptp.transformer import MixedTransformerModel
     from ptp.lit import ParallelSamplingLightningModule
+    if args.gated:
+        from image_ptp.gated_full import GatedFullTransformerModel
 
     if args.backbone == "llamagen":
         from image_ptp.llamagen_hf import build
@@ -77,7 +82,8 @@ def main():
     state_peek = torch.load(Path(args.ckpt).expanduser(), map_location="cpu",
                             weights_only=False)["state_dict"]
     has_lora = any("lora_" in k for k in state_peek)
-    model = MixedTransformerModel(
+    model_cls = GatedFullTransformerModel if args.gated else MixedTransformerModel
+    model = model_cls(
         model_id=inner, dtype=torch.float32,
         lora_config={"r": args.lora_rank, "target_modules": targets} if has_lora else None,
         adapter_name=args.adapter_name,
