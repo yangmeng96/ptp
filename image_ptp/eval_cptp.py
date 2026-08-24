@@ -37,6 +37,12 @@ def parse_args():
     p.add_argument("--num-layers", type=int, default=8)
     p.add_argument("--block-len", type=int, default=7)
     p.add_argument("--images", type=int, default=1024)
+    p.add_argument("--split", type=str, default="val", choices=["val", "train"],
+                   help="ImageTokenDataModule holds out the FIRST val_split "
+                        "sequences, so reading tokens[:images] mixes the two and "
+                        "flatters late checkpoints that have started memorising")
+    p.add_argument("--val-split", type=int, default=256,
+                   help="must match the value the run trained with")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--first-slot-value", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=0)
@@ -118,9 +124,15 @@ def main():
     assert not stale, f"auxiliary embedding did not load: {stale[:3]}"
 
     payload = torch.load(Path(args.data).expanduser(), map_location="cpu")
-    n = min(args.images, payload["tokens"].shape[0])
-    tokens = payload["tokens"][:n].long()
-    left, right = payload["left_bin_edges"][:n], payload["right_bin_edges"][:n]
+    total = payload["tokens"].shape[0]
+    # `ImageTokenDataModule.setup` builds val from make(0, split) and train from
+    # make(split, len), so the held-out sequences are the first ones in the file.
+    split = min(args.val_split, total // 4)
+    lo, hi = (0, split) if args.split == "val" else (split, total)
+    hi = min(hi, lo + args.images)
+    tokens = payload["tokens"][lo:hi].long()
+    left = payload["left_bin_edges"][lo:hi]
+    right = payload["right_bin_edges"][lo:hi]
     bos = 512
 
     real_run, real_acc = score(model, tokens, left, right, bos, args.block_len,
@@ -131,15 +143,15 @@ def main():
                                args.batch_size, shuffle_u=True, seed=args.seed)
     result = {
         "ckpt": args.ckpt, "mode": args.mode, "gated": args.gated,
-        "block_len": args.block_len,
+        "block_len": args.block_len, "split": args.split, "images": hi - lo,
         "correct": real_run, "correct_shuffled": shuf_run,
         "correct_lift": real_run / max(shuf_run, 1e-9),
         "accuracy": real_acc, "accuracy_shuffled": shuf_acc,
         "accuracy_lift": real_acc / max(shuf_acc, 1e-9),
     }
-    print("%-28s mode=%-5s block=%-2d  correct %.3f (shuf %.3f, lift %.2fx)  "
+    print("%-28s %-5s mode=%-5s block=%-2d  correct %.3f (shuf %.3f, lift %.2fx)  "
           "acc %.4f (shuf %.4f, lift %.2fx)" % (
-              Path(args.ckpt).parent.name, args.mode, args.block_len,
+              Path(args.ckpt).parent.name, args.split, args.mode, args.block_len,
               real_run, shuf_run, result["correct_lift"],
               real_acc, shuf_acc, result["accuracy_lift"]))
     if args.out:
