@@ -37,10 +37,13 @@ def parse_args():
     p.add_argument("--num-layers", type=int, default=8)
     p.add_argument("--block-len", type=int, default=7)
     p.add_argument("--images", type=int, default=1024)
-    p.add_argument("--split", type=str, default="val", choices=["val", "train"],
+    p.add_argument("--split", type=str, default="val",
+                   choices=["val", "train", "all"],
                    help="ImageTokenDataModule holds out the FIRST val_split "
                         "sequences, so reading tokens[:images] mixes the two and "
-                        "flatters late checkpoints that have started memorising")
+                        "flatters late checkpoints that have started memorising. "
+                        "Use 'all' with a separately prepared test file, where "
+                        "every sequence is already unseen")
     p.add_argument("--val-split", type=int, default=256,
                    help="must match the value the run trained with")
     p.add_argument("--batch-size", type=int, default=64)
@@ -128,7 +131,8 @@ def main():
     # `ImageTokenDataModule.setup` builds val from make(0, split) and train from
     # make(split, len), so the held-out sequences are the first ones in the file.
     split = min(args.val_split, total // 4)
-    lo, hi = (0, split) if args.split == "val" else (split, total)
+    lo, hi = {"val": (0, split), "train": (split, total),
+              "all": (0, total)}[args.split]
     hi = min(hi, lo + args.images)
     tokens = payload["tokens"][lo:hi].long()
     left = payload["left_bin_edges"][lo:hi]

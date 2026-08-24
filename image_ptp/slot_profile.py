@@ -41,6 +41,10 @@ def parse_args():
     p.add_argument("--gated", action="store_true")
     p.add_argument("--num-layers", type=int, default=8)
     p.add_argument("--block-len", type=int, default=8)
+    p.add_argument("--split", type=str, default="val",
+                   choices=["val", "all"],
+                   help="'all' for a separately prepared test file, whose "
+                        "sequences are unseen in their entirety")
     p.add_argument("--val-split", type=int, default=256)
     p.add_argument("--images", type=int, default=256)
     p.add_argument("--batch-size", type=int, default=64)
@@ -144,7 +148,7 @@ def main():
 
     payload = torch.load(Path(args.data).expanduser(), map_location="cpu")
     total = payload["tokens"].shape[0]
-    split = min(args.val_split, total // 4)
+    split = total if args.split == "all" else min(args.val_split, total // 4)
     hi = min(split, args.images)
     tokens = payload["tokens"][:hi].long()
     left, right = payload["left_bin_edges"][:hi], payload["right_bin_edges"][:hi]
