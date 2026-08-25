@@ -35,6 +35,14 @@ def parse_args():
     p.add_argument("--mode", type=str, default="optp", choices=["optp", "cptp"])
     p.add_argument("--gated", action="store_true")
     p.add_argument("--num-layers", type=int, default=8)
+    p.add_argument("--adapter-name", type=str, default="linear_interpolation",
+                   choices=["linear_interpolation", "binary", "quarter_cos",
+                            "sawtooth", "round"],
+                   help="must match the checkpoint: each class keys its u "
+                        "embedding differently, and a finer variant also "
+                        "changes the parameter's shape")
+    p.add_argument("--adapter-kwargs", type=str, default=None,
+                   help='JSON, e.g. {"num_embeddings": 129}')
     p.add_argument("--block-len", type=int, default=7)
     p.add_argument("--images", type=int, default=1024)
     p.add_argument("--split", type=str, default="val",
@@ -117,6 +125,9 @@ def main():
                          num_layers=args.num_layers)
     cls = GatedFullTransformerModel if args.gated else MixedTransformerModel
     model = cls(model_id=inner, dtype=torch.float32,
+                adapter_name=args.adapter_name,
+                adapter_kwargs=(json.loads(args.adapter_kwargs)
+                                if args.adapter_kwargs else None),
                 attn_implementation="flex_attention").to(device).eval()
     state = torch.load(Path(args.ckpt).expanduser(), map_location="cpu",
                        weights_only=False)["state_dict"]
