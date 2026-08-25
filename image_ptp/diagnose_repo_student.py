@@ -15,6 +15,7 @@ Usage:
         --ckpt ~/ptp-image-exp/llamagen-b-k100/last.ckpt
 """
 import argparse
+import json
 from pathlib import Path
 
 import torch
@@ -37,6 +38,10 @@ def parse_args():
     p.add_argument("--adapter-name", type=str, default="linear_interpolation",
                    help="must match the trained checkpoint, or its u embedding "
                         "silently fails to load and the lift reads as 1.0")
+    p.add_argument("--adapter-kwargs", type=str, default=None,
+                   help='JSON, e.g. {"num_embeddings": 513}. A finer variant '
+                        'changes the parameter shape, so omitting this raises '
+                        'a size mismatch rather than loading quietly')
     p.add_argument("--gpt-model", type=str, default="GPT-B")
     p.add_argument("--gpt-ckpt", type=str, default=None)
     p.add_argument("--data", type=str, required=True)
@@ -87,6 +92,8 @@ def main():
         model_id=inner, dtype=torch.float32,
         lora_config={"r": args.lora_rank, "target_modules": targets} if has_lora else None,
         adapter_name=args.adapter_name,
+        adapter_kwargs=(json.loads(args.adapter_kwargs)
+                        if args.adapter_kwargs else None),
         attn_implementation="flex_attention",
     ).to(device)
     print(f"checkpoint is {'LoRA' if has_lora else 'full finetune'}")
