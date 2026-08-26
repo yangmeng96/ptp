@@ -41,6 +41,9 @@ def parse_args():
                    help="teacher sampling temperature")
     p.add_argument("--student-temperature", type=float, default=0.0,
                    help="0 = argmax, which is what O-PTP prescribes")
+    p.add_argument("--top-j", type=int, nargs="*", default=[1],
+                   help="1 is the argmax O-PTP prescribes; larger j samples "
+                        "from the j highest logits")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out-dir", type=str, required=True)
     return p.parse_args()
@@ -59,7 +62,8 @@ def sample_teacher(model, batch, seq_len, bos, temperature, device):
 
 
 @torch.no_grad()
-def sample_ptp(mixed, batch, seq_len, bos, block_len, device, temperature=0.0):
+def sample_ptp(mixed, batch, seq_len, bos, block_len, device, temperature=0.0,
+               top_j=1):
     """Block-wise O-PTP sampling: draw u, run one forward, read off the block.
 
     `MixedTransformerModel.forward` runs the prefix without adapters to build the
@@ -79,7 +83,17 @@ def sample_ptp(mixed, batch, seq_len, bos, block_len, device, temperature=0.0):
         with mixed.enable_adapters(enabled=True):
             _, completion = mixed(input_ids=seq, auxiliaries=u)
         logits = completion.logits[:, :span, :].float()
-        if temperature > 0:
+        if top_j > 1:
+            # Scoring at top-j says the true token is usually near the front of
+            # the ordering even when it is not first. Sampling from that front
+            # shows what the ordering is worth when nothing verifies the pick --
+            # note this adds randomness the formulation does not have, since u
+            # was meant to carry all of it.
+            vals, idx = logits.topk(top_j, dim=-1)
+            probs = torch.softmax(vals, dim=-1).reshape(-1, top_j)
+            choice = torch.multinomial(probs, 1).view(batch, span, 1)
+            proposed = idx.gather(-1, choice).squeeze(-1)
+        elif temperature > 0:
             probs = torch.softmax(logits / temperature, dim=-1)
             proposed = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1)
             proposed = proposed.view(batch, span)
@@ -150,10 +164,11 @@ def main():
         missing, unexpected = mixed.load_state_dict(stripped, strict=False)
         print(f"{name}: {'LoRA' if has_lora else 'full'}, "
               f"{len(missing)} missing, {len(unexpected)} unexpected")
-        for temp, suffix in ((0.0, "argmax"), (1.0, "temp1")):
+        for j in args.top_j:
             torch.manual_seed(args.seed)
             save(sample_ptp(mixed, args.num_images, seq_len, bos, args.block_len,
-                            device, temperature=temp), f"ptp_{name}_{suffix}")
+                            device, temperature=0.0, top_j=j),
+                 f"ptp_{name}_top{j}")
         del mixed, inner
         torch.cuda.empty_cache()
 
