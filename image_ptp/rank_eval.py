@@ -55,6 +55,13 @@ def parse_args():
                         "built with, since it changes the CDF u inverts")
     p.add_argument("--top-k", type=int, default=100)
     p.add_argument("--top-p", type=float, default=0.999)
+    p.add_argument("--teacher-dtype", type=str, default="bfloat16",
+                   choices=["bfloat16", "float32"],
+                   help="llamagen only: pregenerate.py takes load_llamagen's "
+                        "bfloat16 default, so edges cached by it describe a "
+                        "bf16 teacher. Inverting an fp32 one recovered 0.64. "
+                        "Note the RoPE table is also built per device, so this "
+                        "has to run where the edges were generated")
     p.add_argument("--bos", type=int, default=512)
     p.add_argument("--code-vocab", type=int, default=16384)
     p.add_argument("--seed", type=int, default=0)
@@ -192,7 +199,8 @@ def main():
             root = Path(args.llamagen_root).expanduser()
             gpt, _ = load_llamagen(root, args.gpt_model,
                                    args.gpt_ckpt or str(root / "pretrained_models/c2i_B_256.pt"),
-                                   dtype=torch.float32, device=device)
+                                   dtype=getattr(torch, args.teacher_dtype),
+                                   device=device)
             lg_teacher = {"model": LlamaGenPTP(gpt, lora_rank=4).to(device).eval(),
                           "filter": top_k_top_p_filter, "cfg": args.cfg_scale,
                           "top_k": args.top_k, "top_p": args.top_p,
