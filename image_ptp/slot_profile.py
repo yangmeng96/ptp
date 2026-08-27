@@ -35,12 +35,17 @@ import torch
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--ar-ckpt", type=str, required=True)
+    p.add_argument("--ar-ckpt", type=str, default=None)
     p.add_argument("--data", type=str, required=True)
     p.add_argument("--ckpt", type=str, required=True)
     p.add_argument("--mode", type=str, default="optp", choices=["optp", "cptp"])
     p.add_argument("--gated", action="store_true")
     p.add_argument("--num-layers", type=int, default=8)
+    p.add_argument("--backbone", type=str, default="vqvae_ar",
+                   choices=["vqvae_ar", "llamagen"])
+    p.add_argument("--llamagen-root", type=str, default="/home/mengy13/LlamaGen")
+    p.add_argument("--gpt-model", type=str, default="GPT-B")
+    p.add_argument("--gpt-ckpt", type=str, default=None)
     p.add_argument("--adapter-name", type=str, default="linear_interpolation",
                    choices=["linear_interpolation", "binary", "quarter_cos",
                             "sawtooth", "round"],
@@ -59,12 +64,13 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--first-slot-value", type=float, default=0.5)
     p.add_argument("--bos", type=int, default=512)
+    p.add_argument("--code-vocab", type=int, default=16384)
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
 
 @torch.no_grad()
-def profile(model, tokens, left, right, bos, block_len, mode, first_slot,
+def profile(model, tokens, first, left, right, block_len, mode, first_slot,
             device, batch_size, shuffle_u, seed):
     """Return per-slot hit counts, plus the same split by block position."""
     torch.manual_seed(seed)
@@ -84,7 +90,7 @@ def profile(model, tokens, left, right, bos, block_len, mode, first_slot,
         t = tokens[s:s + batch_size].to(device)
         l = left[s:s + batch_size].to(device)
         r = right[s:s + batch_size].to(device)
-        ids = torch.cat([torch.full((t.shape[0], 1), bos, device=device), t], 1)
+        ids = torch.cat([first[s:s + batch_size].to(device)[:, None], t], 1)
         for bi, start in enumerate(starts):
             span = min(block_len, seq_len - start + 1)
             lo = l[:, start - 1:start - 1 + span]
@@ -133,17 +139,38 @@ def profile(model, tokens, left, right, bos, block_len, mode, first_slot,
     return out
 
 
+
+def first_positions(payload, n, args):
+    """The token that opens each sequence.
+
+    The VQ-VAE arms prepend one shared BOS. LlamaGen instead carries the class
+    label in the extended vocabulary, so the opening token differs per sample and
+    a constant would condition every sequence on class 0.
+    """
+    if args.backbone == "llamagen":
+        labels = payload["labels"][:n].long()
+        return labels + args.code_vocab
+    return torch.full((n,), args.bos, dtype=torch.long)
+
+
 def main():
     args = parse_args()
     torch.set_grad_enabled(False)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    from image_ptp.vqvae_ar_hf import build_module
     from ptp.transformer import MixedTransformerModel
     from image_ptp.gated_full import GatedFullTransformerModel
 
-    inner = build_module(args.ar_ckpt, device=device, dtype=torch.float32,
-                         num_layers=args.num_layers)
+    if args.backbone == "llamagen":
+        from image_ptp.llamagen_hf import build as build_lg
+        root = Path(args.llamagen_root).expanduser()
+        inner, _ = build_lg(root, args.gpt_model,
+                            args.gpt_ckpt or str(root / "pretrained_models/c2i_B_256.pt"),
+                            dtype=torch.float32, device=device)
+    else:
+        from image_ptp.vqvae_ar_hf import build_module
+        inner = build_module(args.ar_ckpt, device=device, dtype=torch.float32,
+                             num_layers=args.num_layers)
     cls = GatedFullTransformerModel if args.gated else MixedTransformerModel
     model = cls(model_id=inner, dtype=torch.float32,
                 adapter_name=args.adapter_name,
@@ -164,13 +191,14 @@ def main():
     hi = min(split, args.images)
     tokens = payload["tokens"][:hi].long()
     left, right = payload["left_bin_edges"][:hi], payload["right_bin_edges"][:hi]
+    first = first_positions(payload, hi, args)
     print(f"{hi} held-out sequences of {tokens.shape[1]} tokens, "
           f"block {args.block_len}, mode {args.mode}")
 
-    real = profile(model, tokens, left, right, args.bos, args.block_len,
+    real = profile(model, tokens, first, left, right, args.block_len,
                    args.mode, args.first_slot_value, device, args.batch_size,
                    False, args.seed)
-    shuf = profile(model, tokens, left, right, args.bos, args.block_len,
+    shuf = profile(model, tokens, first, left, right, args.block_len,
                    args.mode, args.first_slot_value, device, args.batch_size,
                    True, args.seed)
 

@@ -29,11 +29,16 @@ import torch
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--ar-ckpt", type=str, required=True)
+    p.add_argument("--ar-ckpt", type=str, default=None)
     p.add_argument("--data", type=str, required=True)
     p.add_argument("--ckpt", type=str, required=True)
     p.add_argument("--gated", action="store_true")
     p.add_argument("--num-layers", type=int, default=8)
+    p.add_argument("--backbone", type=str, default="vqvae_ar",
+                   choices=["vqvae_ar", "llamagen"])
+    p.add_argument("--llamagen-root", type=str, default="/home/mengy13/LlamaGen")
+    p.add_argument("--gpt-model", type=str, default="GPT-B")
+    p.add_argument("--gpt-ckpt", type=str, default=None)
     p.add_argument("--adapter-name", type=str, default="linear_interpolation")
     p.add_argument("--adapter-kwargs", type=str, default=None)
     p.add_argument("--block-len", type=int, default=7)
@@ -46,6 +51,7 @@ def parse_args():
                    help="decide slot 0 by inverting the frozen teacher's CDF "
                         "at u_0 instead of taking the student's argmax")
     p.add_argument("--bos", type=int, default=512)
+    p.add_argument("--code-vocab", type=int, default=16384)
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -55,7 +61,7 @@ def leading_run(ok):
 
 
 @torch.no_grad()
-def run(model, teacher, tokens, left, right, bos, block_len, topj, oracle0,
+def run(model, teacher, tokens, first, left, right, block_len, topj, oracle0,
         device, batch_size, seed):
     torch.manual_seed(seed)
     seq_len = tokens.shape[1]
@@ -70,7 +76,7 @@ def run(model, teacher, tokens, left, right, bos, block_len, topj, oracle0,
         t = tokens[s:s + batch_size].to(device)
         l = left[s:s + batch_size].to(device)
         r = right[s:s + batch_size].to(device)
-        ids = torch.cat([torch.full((t.shape[0], 1), bos, device=device), t], 1)
+        ids = torch.cat([first[s:s + batch_size].to(device)[:, None], t], 1)
         for start in starts:
             span = min(block_len, seq_len - start + 1)
             lo = l[:, start - 1:start - 1 + span]
@@ -113,17 +119,40 @@ def run(model, teacher, tokens, left, right, bos, block_len, topj, oracle0,
     return out
 
 
+
+def first_positions(payload, n, args):
+    """The token that opens each sequence.
+
+    The VQ-VAE arms prepend one shared BOS. LlamaGen instead carries the class
+    label in the extended vocabulary, so the opening token differs per sample and
+    a constant would condition every sequence on class 0.
+    """
+    if args.backbone == "llamagen":
+        labels = payload["labels"][:n].long()
+        return labels + args.code_vocab
+    return torch.full((n,), args.bos, dtype=torch.long)
+
+
 def main():
     args = parse_args()
     torch.set_grad_enabled(False)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    from image_ptp.vqvae_ar_hf import build, build_module
+    from image_ptp.vqvae_ar_hf import build
     from ptp.transformer import MixedTransformerModel
     from image_ptp.gated_full import GatedFullTransformerModel
 
-    inner = build_module(args.ar_ckpt, device=device, dtype=torch.float32,
-                         num_layers=args.num_layers)
+    build_lg = None
+    if args.backbone == "llamagen":
+        from image_ptp.llamagen_hf import build as build_lg
+        root = Path(args.llamagen_root).expanduser()
+        inner, _ = build_lg(root, args.gpt_model,
+                            args.gpt_ckpt or str(root / "pretrained_models/c2i_B_256.pt"),
+                            dtype=torch.float32, device=device)
+    else:
+        from image_ptp.vqvae_ar_hf import build_module
+        inner = build_module(args.ar_ckpt, device=device, dtype=torch.float32,
+                             num_layers=args.num_layers)
     cls = GatedFullTransformerModel if args.gated else MixedTransformerModel
     model = cls(model_id=inner, dtype=torch.float32,
                 adapter_name=args.adapter_name,
@@ -140,7 +169,13 @@ def main():
 
     teacher = None
     if args.oracle_slot0:
-        teacher, _ = build(args.ar_ckpt, device=device, dtype=torch.float32)
+        if args.backbone == "llamagen":
+            root = Path(args.llamagen_root).expanduser()
+            teacher, _ = build_lg(root, args.gpt_model,
+                                  args.gpt_ckpt or str(root / "pretrained_models/c2i_B_256.pt"),
+                                  dtype=torch.float32, device=device)
+        else:
+            teacher, _ = build(args.ar_ckpt, device=device, dtype=torch.float32)
         teacher.eval()
 
     payload = torch.load(Path(args.data).expanduser(), map_location="cpu")
@@ -149,8 +184,9 @@ def main():
     hi = min(split, args.images)
     tokens = payload["tokens"][:hi].long()
     left, right = payload["left_bin_edges"][:hi], payload["right_bin_edges"][:hi]
+    first = first_positions(payload, hi, args)
 
-    res = run(model, teacher, tokens, left, right, args.bos, args.block_len,
+    res = run(model, teacher, tokens, first, left, right, args.block_len,
               args.topj, args.oracle_slot0, device, args.batch_size, args.seed)
     tag = Path(args.ckpt).parent.name + (" +oracle-slot0" if args.oracle_slot0 else "")
     print(f"{tag}   {hi} sequences, block {args.block_len}")
