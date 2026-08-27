@@ -171,6 +171,7 @@ def stage_var(epochs=30, depth=8, embed_dim=512):
     print(f"var params {sum(p.numel() for p in var.parameters())/1e6:.1f}M, "
           f"L={var.L}", flush=True)
     started = time.time()
+    best = float("inf")
     for ep in range(epochs):
         var.train()
         tot = n = 0.0
@@ -201,10 +202,14 @@ def stage_var(epochs=30, depth=8, embed_dim=512):
                                            truth.reshape(-1))) * x.shape[0]
                 m += x.shape[0]
         var.cond_drop_rate = 0.1
+        mark = ""
+        if v / m < best:
+            best = v / m
+            torch.save(var.state_dict(), OUT / "var.pt")
+            mark = "  <- kept"
         print(f"epoch {ep+1}/{epochs} train {tot/n:.4f} test {v/m:.4f} "
-              f"({time.time()-started:.0f}s)", flush=True)
-        torch.save(var.state_dict(), OUT / "var.pt")
-    print(f"wrote {OUT/'var.pt'}", flush=True)
+              f"({time.time()-started:.0f}s){mark}", flush=True)
+    print(f"wrote {OUT/'var.pt'} at test {best:.4f}", flush=True)
 
 
 def stage_sample(n=16, cfg=2.0, top_k=100):
