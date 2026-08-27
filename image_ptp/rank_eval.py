@@ -224,12 +224,16 @@ def main():
     print(f"{tag}   {hi} sequences, block {args.block_len}")
     if "slot0" in res:
         print(f"  oracle slot 0 recovers the token: {res['slot0']:.4f}")
-        # By construction the edges describe the teacher, so this is 1.0 when the
-        # oracle inverts the same distribution they came from. Anything less means
-        # it does not, and every number below is measuring the wrong thing.
-        assert res["slot0"] > 0.99, (
+        # By construction the edges describe the teacher, so an fp32 teacher
+        # recovers exactly 1.0 -- MNIST and CIFAR both do. bfloat16 matmuls are
+        # not bit-reproducible, which costs LlamaGen about 2%. The threshold has
+        # to allow that while still catching the real failures: inverting an
+        # fp32 teacher when the edges came from a bf16 one recovers 0.64, and
+        # skipping guidance and truncation altogether recovers 0.16.
+        assert res["slot0"] > 0.97, (
             f"oracle recovered only {res['slot0']:.4f}: the CDF being inverted is "
-            "not the one the bin edges describe -- check cfg/top_k/top_p")
+            "not the one the bin edges describe -- check cfg/top_k/top_p, the "
+            "teacher dtype, and whether this is the machine that generated them")
     print("  top-j   correct    accuracy")
     for j in args.topj:
         run_len, acc = res[j]
