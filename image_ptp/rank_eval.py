@@ -50,6 +50,11 @@ def parse_args():
     p.add_argument("--oracle-slot0", action="store_true",
                    help="decide slot 0 by inverting the frozen teacher's CDF "
                         "at u_0 instead of taking the student's argmax")
+    p.add_argument("--cfg-scale", type=float, default=4.0,
+                   help="llamagen only: must match the value the bin edges were "
+                        "built with, since it changes the CDF u inverts")
+    p.add_argument("--top-k", type=int, default=100)
+    p.add_argument("--top-p", type=float, default=0.999)
     p.add_argument("--bos", type=int, default=512)
     p.add_argument("--code-vocab", type=int, default=16384)
     p.add_argument("--seed", type=int, default=0)
@@ -62,7 +67,7 @@ def leading_run(ok):
 
 @torch.no_grad()
 def run(model, teacher, tokens, first, left, right, block_len, topj, oracle0,
-        device, batch_size, seed):
+        device, batch_size, seed, lg_teacher=None):
     torch.manual_seed(seed)
     seq_len = tokens.shape[1]
     starts = list(range(1, seq_len - block_len + 1, block_len))
@@ -92,8 +97,18 @@ def run(model, teacher, tokens, first, left, right, block_len, topj, oracle0,
 
             if oracle0:
                 # The teacher's distribution for slot 0 is conditioned only on
-                # real tokens, so inverting it at u_0 returns the token exactly.
-                tl = teacher(input_ids=ids[:, :start]).logits[:, -1].float()
+                # real tokens, so inverting it at u_0 returns the token exactly --
+                # but only if it is the same distribution the edges came from.
+                # LlamaGen's were built under guidance and truncation, and the
+                # raw logits invert to something else entirely (0.157 recovered).
+                if lg_teacher is not None:
+                    raw = lg_teacher["model"].teacher_logits(
+                        first[s:s + batch_size].to(device) - lg_teacher["code_vocab"],
+                        t, lg_teacher["cfg"])[:, start - 1]
+                    tl = lg_teacher["filter"](
+                        raw.clone(), lg_teacher["top_k"], lg_teacher["top_p"]).float()
+                else:
+                    tl = teacher(input_ids=ids[:, :start]).logits[:, -1].float()
                 cdf = torch.softmax(tl, -1).cumsum(-1)
                 pick = torch.searchsorted(cdf.contiguous(),
                                           u[:, :1].contiguous()).squeeze(-1)
@@ -167,16 +182,24 @@ def main():
     stale = [k for k in list(missing) + list(unexpected) if "u_embed" in k]
     assert not stale, f"auxiliary embedding did not load: {stale[:3]}"
 
-    teacher = None
+    teacher, lg_teacher = None, None
     if args.oracle_slot0:
         if args.backbone == "llamagen":
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from llamagen_ptp import (LlamaGenPTP, load_llamagen,
+                                      top_k_top_p_filter)
             root = Path(args.llamagen_root).expanduser()
-            teacher, _ = build_lg(root, args.gpt_model,
-                                  args.gpt_ckpt or str(root / "pretrained_models/c2i_B_256.pt"),
-                                  dtype=torch.float32, device=device)
+            gpt, _ = load_llamagen(root, args.gpt_model,
+                                   args.gpt_ckpt or str(root / "pretrained_models/c2i_B_256.pt"),
+                                   dtype=torch.float32, device=device)
+            lg_teacher = {"model": LlamaGenPTP(gpt, lora_rank=4).to(device).eval(),
+                          "filter": top_k_top_p_filter, "cfg": args.cfg_scale,
+                          "top_k": args.top_k, "top_p": args.top_p,
+                          "code_vocab": args.code_vocab}
         else:
             teacher, _ = build(args.ar_ckpt, device=device, dtype=torch.float32)
-        teacher.eval()
+            teacher.eval()
 
     payload = torch.load(Path(args.data).expanduser(), map_location="cpu")
     total = payload["tokens"].shape[0]
@@ -187,11 +210,18 @@ def main():
     first = first_positions(payload, hi, args)
 
     res = run(model, teacher, tokens, first, left, right, args.block_len,
-              args.topj, args.oracle_slot0, device, args.batch_size, args.seed)
+              args.topj, args.oracle_slot0, device, args.batch_size, args.seed,
+              lg_teacher=lg_teacher)
     tag = Path(args.ckpt).parent.name + (" +oracle-slot0" if args.oracle_slot0 else "")
     print(f"{tag}   {hi} sequences, block {args.block_len}")
     if "slot0" in res:
         print(f"  oracle slot 0 recovers the token: {res['slot0']:.4f}")
+        # By construction the edges describe the teacher, so this is 1.0 when the
+        # oracle inverts the same distribution they came from. Anything less means
+        # it does not, and every number below is measuring the wrong thing.
+        assert res["slot0"] > 0.99, (
+            f"oracle recovered only {res['slot0']:.4f}: the CDF being inverted is "
+            "not the one the bin edges describe -- check cfg/top_k/top_p")
     print("  top-j   correct    accuracy")
     for j in args.topj:
         run_len, acc = res[j]
