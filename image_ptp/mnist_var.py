@@ -226,6 +226,188 @@ def stage_sample(n=16, cfg=2.0, top_k=100):
     print(f"wrote {path}", flush=True)
 
 
+def loo_mask(n, device):
+    """(2n, 2n) bool, True = forbidden. Queries 0..n-1, token keys n..2n-1.
+
+    Queries may not read each other: after one layer a query has already taken in
+    every token but its own, so query i reading query j would recover t_i.
+    """
+    m = torch.ones(2 * n, 2 * n, dtype=torch.bool, device=device)
+    idx = torch.arange(n, device=device)
+    m[idx, idx] = False
+    m[idx.unsqueeze(1), (idx + n).unsqueeze(0)] = False
+    m[idx, idx + n] = True
+    m[idx + n, idx + n] = False
+    return m
+
+
+class LooHead(nn.Module):
+    """mode 'none' sees no tokens of the scale; 'loo' sees every one but its own."""
+
+    def __init__(self, mode, c_var, c=384, layers=2, heads=6, max_len=64):
+        super().__init__()
+        self.mode = mode
+        self.proj = nn.Linear(c_var, c)
+        self.tok = nn.Embedding(VOCAB + 1, c)
+        self.pos = nn.Parameter(torch.zeros(1, max_len, c))
+        self.kind = nn.Parameter(torch.zeros(2, c))
+        layer = nn.TransformerEncoderLayer(
+            d_model=c, nhead=heads, dim_feedforward=4 * c, dropout=0.0,
+            batch_first=True, norm_first=True, activation="gelu")
+        self.enc = nn.TransformerEncoder(layer, num_layers=layers)
+        self.norm = nn.LayerNorm(c)
+        self.out = nn.Linear(c, VOCAB)
+
+    def forward(self, h_seg, tok_seg):
+        b, n, _ = h_seg.shape
+        q = self.proj(h_seg) + self.pos[:, :n] + self.kind[0]
+        k = self.tok(tok_seg if self.mode == "loo"
+                     else torch.full_like(tok_seg, VOCAB))
+        k = k + self.pos[:, :n] + self.kind[1]
+        x = torch.cat([q, k], dim=1)
+        x = self.enc(x, mask=loo_mask(n, x.device))
+        return self.out(self.norm(x[:, :n]))
+
+
+def stage_loo(steps=4000, eval_every=1000, unfreeze=2, c_var=512):
+    """Does a scale of this VAR hold information about itself?
+
+    Same design as the ImageNet run: two heads of identical size and shape, each
+    with its own trainable copy of the top blocks so their gradients never mix in
+    the layers under test. One is shown every other token of the scale, the other
+    a constant. The gap between them is the within-scale information.
+    """
+    import copy
+    ensure_process_group()
+    vae, var = build_var()
+    vae.load_state_dict(torch.load(OUT / "vqvae.pt", map_location="cpu"))
+    var.load_state_dict(torch.load(OUT / "var.pt", map_location="cpu"))
+    vae.eval().requires_grad_(False)
+    var.eval().requires_grad_(False)
+    var.cond_drop_rate = 0.0
+
+    cut = len(var.blocks) - unfreeze
+    cap = {}
+
+    def pre_hook(mod, args, kwargs):
+        cap["x"], cap["cond_BD"], cap["attn_bias"] = (
+            kwargs["x"], kwargs["cond_BD"], kwargs["attn_bias"])
+    var.blocks[cut].register_forward_pre_hook(pre_hook, with_kwargs=True)
+
+    bounds, cur = [], 0
+    for pn in PATCH:
+        bounds.append((cur, cur + pn * pn, pn))
+        cur += pn * pn
+
+    class Arm(nn.Module):
+        def __init__(self, mode):
+            super().__init__()
+            self.blocks = copy.deepcopy(var.blocks[cut:]).requires_grad_(True)
+            self.head = LooHead(mode, c_var)
+
+        def forward(self, truth):
+            x = cap["x"]
+            for b in self.blocks:
+                x = b(x=x, cond_BD=cap["cond_BD"], attn_bias=cap["attn_bias"])
+            h = x.float()
+            return [self.head(h[:, a:b], truth[:, a:b]) for a, b, _ in bounds]
+
+    arms = {"A_no_context": Arm("none").to(device),
+            "C_leave_one_out": Arm("loo").to(device)}
+    for name, m in arms.items():
+        bad = [k for k, q in m.named_parameters() if not torch.isfinite(q).all()]
+        assert not bad, f"{name} non-finite: {bad[:3]}"
+        print(f"{name}: {sum(p.numel() for p in m.parameters())/1e6:.1f}M", flush=True)
+
+    with torch.no_grad():
+        probe = arms["C_leave_one_out"].head
+        hh = torch.randn(2, 8, c_var, device=device)
+        t1 = torch.randint(0, VOCAB, (2, 8), device=device)
+        t2 = t1.clone()
+        t2[:, 3] = (t2[:, 3] + 1) % VOCAB
+        o1, o2 = probe(hh, t1), probe(hh, t2)
+        own = float((o1[:, 3] - o2[:, 3]).abs().max())
+        other = float((o1[:, 5] - o2[:, 5]).abs().max())
+    print(f"leakage check: token 3 moves slot 3 by {own:.2e}, slot 5 by {other:.2e}",
+          flush=True)
+    assert own < 1e-5 and other > 1e-4, "leave-one-out mask is wrong"
+
+    opt = torch.optim.AdamW([
+        {"params": [p for m in arms.values() for p in m.blocks.parameters()],
+         "lr": 2e-5},
+        {"params": [p for m in arms.values() for p in m.head.parameters()],
+         "lr": 3e-4}], weight_decay=0.01)
+
+    train_ld = mnist_loader(True, batch=64)
+    test_ld = mnist_loader(False, batch=64, workers=2)
+
+    def var_pass(x, y):
+        with torch.no_grad():
+            gt = vae.img_to_idxBl(x)
+            var(y, vae.quantize.idxBl_to_var_input(gt))
+        return torch.cat(gt, dim=1)
+
+    def arm_losses(arm, truth, reduction="mean"):
+        return [F.cross_entropy(o.reshape(-1, VOCAB),
+                                truth[:, a:b].reshape(-1), reduction=reduction)
+                for o, (a, b, _) in zip(arm(truth), bounds)]
+
+    @torch.no_grad()
+    def evaluate():
+        acc = {k: torch.zeros(len(bounds)) for k in list(arms) + ["VAR"]}
+        n = 0
+        for x, y in test_ld:
+            x, y = x.to(device), y.to(device)
+            with torch.no_grad():
+                gt = vae.img_to_idxBl(x)
+                logits = var(y, vae.quantize.idxBl_to_var_input(gt)).float()
+            truth = torch.cat(gt, dim=1)
+            for s, (a, b, _) in enumerate(bounds):
+                acc["VAR"][s] += float(F.cross_entropy(
+                    logits[:, a:b].reshape(-1, VOCAB), truth[:, a:b].reshape(-1),
+                    reduction="sum"))
+            for k, m in arms.items():
+                for s, l in enumerate(arm_losses(m, truth, reduction="sum")):
+                    acc[k][s] += float(l)
+            n += x.shape[0]
+        return {k: v / n for k, v in acc.items()}
+
+    def report(r, tag):
+        A, C, V = r["A_no_context"], r["C_leave_one_out"], r["VAR"]
+        print(f"\n--- {tag} ---")
+        print("scale  tokens   VAR    head A   head C   A-C (nats/tok)  gain/image")
+        for s, (a, b, pn) in enumerate(bounds):
+            n = b - a
+            print(f"{pn:>3}x{pn:<3} {n:>5}  {V[s]/n:6.3f}  {A[s]/n:7.3f}  "
+                  f"{C[s]/n:7.3f}  {(A[s]-C[s])/n:13.4f}  {A[s]-C[s]:10.2f}")
+        ta, tc = float(A.sum()), float(C.sum())
+        print(f"per image: VAR {float(V.sum()):.2f}  A {ta:.2f}  C {tc:.2f}  "
+              f"within-scale information {ta-tc:.2f} nats "
+              f"({100*(ta-tc)/ta:.2f}% of A)", flush=True)
+
+    report(evaluate(), "before training")
+    step, started = 0, time.time()
+    while step < steps:
+        for x, y in train_ld:
+            if step >= steps:
+                break
+            x, y = x.to(device, non_blocking=True), y.to(device)
+            truth = var_pass(x, y)
+            loss = sum(sum(arm_losses(m, truth)) for m in arms.values())
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for m in arms.values() for p in m.parameters()], 1.0)
+            opt.step()
+            step += 1
+            if step % 200 == 0:
+                print(f"step {step}/{steps} loss {float(loss):.3f} "
+                      f"({step/(time.time()-started):.2f} it/s)", flush=True)
+            if step % eval_every == 0 or step == steps:
+                report(evaluate(), f"step {step}")
+    print("MNIST_LOO_DONE", flush=True)
+
+
 if __name__ == "__main__":
     stage = os.environ.get("STAGE", "vqvae")
     if stage == "vqvae":
@@ -234,5 +416,7 @@ if __name__ == "__main__":
         stage_var(epochs=int(os.environ.get("EPOCHS", 30)))
     elif stage == "sample":
         stage_sample()
+    elif stage == "loo":
+        stage_loo(steps=int(os.environ.get("STEPS", 4000)))
     else:
         raise SystemExit(f"unknown STAGE {stage}")
