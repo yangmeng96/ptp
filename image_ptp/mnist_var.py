@@ -212,23 +212,42 @@ def stage_var(epochs=30, depth=8, embed_dim=512):
     print(f"wrote {OUT/'var.pt'} at test {best:.4f}", flush=True)
 
 
-def stage_sample(n=16, cfg=2.0, top_k=100):
+def stage_sample(per_class=10, top_k=100, seed=0):
+    """One row per digit, at several guidance scales.
+
+    Guidance is the knob that trades fidelity for variety here as everywhere:
+    low cfg gives messier digits with more handwriting variation, high cfg gives
+    cleaner ones that look more alike.
+    """
     ensure_process_group()
     vae, var = build_var()
     vae.load_state_dict(torch.load(OUT / "vqvae.pt", map_location="cpu"))
     var.load_state_dict(torch.load(OUT / "var.pt", map_location="cpu"))
-    vae.eval(); var.eval()
+    vae.eval()
+    var.eval()
     var.cond_drop_rate = 0.0
-    labels = torch.arange(n, device=device) % NUM_CLASSES
-    with torch.no_grad():
-        img = var.autoregressive_infer_cfg(B=n, label_B=labels, cfg=cfg,
-                                           top_k=top_k, top_p=0.95,
-                                           more_smooth=False)
     from torchvision.utils import save_image
-    path = OUT / "samples.png"
-    save_image(img, path, nrow=8)
-    print(f"labels {labels.tolist()}")
-    print(f"wrote {path}", flush=True)
+    labels = torch.arange(NUM_CLASSES, device=device).repeat_interleave(per_class)
+    for cfg in (float(x) for x in os.environ.get("CFGS", "1.0,1.5,2.5,4.0").split(",")):
+        torch.manual_seed(seed)
+        with torch.no_grad():
+            img = var.autoregressive_infer_cfg(
+                B=labels.shape[0], label_B=labels, cfg=cfg, top_k=top_k,
+                top_p=0.95, more_smooth=False)
+        path = OUT / f"samples_cfg{cfg:g}.png"
+        save_image(img, path, nrow=per_class)
+        print(f"cfg {cfg:g} -> {path}", flush=True)
+    # A reconstruction strip, to separate what the tokeniser costs from what the
+    # transformer costs: anything the autoencoder cannot represent is a ceiling
+    # the sampler could never beat.
+    xs, ys = next(iter(mnist_loader(False, per_class * 2, 0)))
+    with torch.no_grad():
+        rec, _, _ = vae(xs.to(device))
+    save_image(torch.cat([xs.to(device), rec]).clamp(-1, 1),
+               OUT / "reconstruction.png", nrow=per_class * 2, normalize=True,
+               value_range=(-1, 1))
+    print(f"wrote {OUT/'reconstruction.png'} (top row real, bottom reconstructed)",
+          flush=True)
 
 
 def loo_mask(n, device):
