@@ -44,10 +44,21 @@ device = "cuda"
 
 
 def ensure_process_group():
+    """VectorQuantizer2.forward calls torch.distributed.get_world_size() with no
+    initialisation guard, so a single-process group has to exist.
+
+    File-based rendezvous rather than a fixed TCP port: two array tasks landing
+    on the same node both tried to bind 29517 and the second died with
+    EADDRINUSE.
+    """
+    import tempfile
     import torch.distributed as tdist
-    if not tdist.is_initialized():
-        tdist.init_process_group(backend="gloo", init_method="tcp://127.0.0.1:29517",
-                                 rank=0, world_size=1)
+    if tdist.is_initialized():
+        return
+    path = Path(tempfile.gettempdir()) / f"ptp_pg_{os.getpid()}"
+    path.unlink(missing_ok=True)
+    tdist.init_process_group(backend="gloo", init_method=f"file://{path}",
+                             rank=0, world_size=1)
 
 
 class ResBlock(nn.Module):
