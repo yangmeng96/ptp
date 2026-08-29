@@ -108,8 +108,11 @@ def main():
     # What the same tokens cost an autoregressive model: the floor this cannot reach.
     with torch.no_grad():
         ids = torch.cat([torch.full((val, 1), bos, device=device), va_t], 1)
+        # The AR model's vocabulary carries BOS on top of the codes, so its
+        # logits are one wider than the generator's.
+        ar_logits = teacher(input_ids=ids).logits[:, :-1]
         ar = float(F.cross_entropy(
-            teacher(input_ids=ids).logits[:, :-1].reshape(-1, V), va_t.reshape(-1)))
+            ar_logits.reshape(-1, ar_logits.shape[-1]), va_t.reshape(-1)))
     print(f"autoregressive teacher on the same held-out tokens: {ar:.4f} nats/token",
           flush=True)
 
