@@ -128,6 +128,77 @@ def var_input(vae, gt, device):
     return x
 
 
+def build_ptp_student(vae, patch_nums, adapter="binary", num_classes=10,
+                      depth=8, embed_dim=512, heads=8, device="cuda"):
+    """The same model with u in place of the within-scale token stream.
+
+    O-PTP's slot i is given u_i and every u_j before it in the block, and must
+    emit the token the teacher's inverse CDF selects. Here the block is a whole
+    scale, and the teacher is the within-scale AR model above -- whose mask is
+    already causal within a scale. So the only change is the input: position i
+    receives an embedding of u_i instead of an embedding of t_{i-1}. Nothing
+    about the attention changes, which is what makes the two directly comparable.
+    """
+    from ptp import auxiliary_embed
+
+    base = build_within_scale_var(vae, patch_nums, num_classes=num_classes,
+                                  depth=depth, embed_dim=embed_dim, heads=heads,
+                                  device=device)
+    cls = {"binary": auxiliary_embed.BinaryFloatEmbedding,
+           "linear_interpolation": auxiliary_embed.LinearInterpolationEmbedding,
+           "quarter_cos": auxiliary_embed.QuarterCosEmbedding}[adapter]
+    base.u_embed = cls(base.C).to(device)
+    base.wtok = None          # the token stream is what u replaces
+
+    def forward(self, label_B, x_BLCv_wo_first_l, u=None, truth=None):
+        assert u is not None, "the PTP student is driven by u, not by tokens"
+        B = u.shape[0]
+        with torch.cuda.amp.autocast(enabled=False):
+            label_B = torch.where(
+                torch.rand(B, device=label_B.device) < self.cond_drop_rate,
+                self.num_classes, label_B)
+            sos = cond_BD = self.class_emb(label_B)
+            sos = (sos.unsqueeze(1).expand(B, self.first_l, -1)
+                   + self.pos_start.expand(B, self.first_l, -1))
+            if x_BLCv_wo_first_l is None or x_BLCv_wo_first_l.shape[1] == 0:
+                x_BLC = sos
+            else:
+                x_BLC = torch.cat(
+                    (sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
+            x_BLC = x_BLC + (self.lvl_embed(self.lvl_1L.expand(B, -1))
+                             + self.pos_1LC)
+            x_BLC = x_BLC + self.u_embed(u)
+        attn_bias = self.within_scale_bias
+        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+        temp = x_BLC.new_ones(8, 8)
+        main_type = torch.matmul(temp, temp).dtype
+        x_BLC = x_BLC.to(dtype=main_type)
+        cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
+        attn_bias = attn_bias.to(dtype=main_type)
+        for b in self.blocks:
+            x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+        return self.get_logits(x_BLC.float(), cond_BD)
+
+    base.forward = forward.__get__(base, type(base))
+    return base
+
+
+@torch.no_grad()
+def bin_edges(teacher, vae, labels, gt, device):
+    """The interval the within-scale AR teacher assigns to each true token.
+
+    u drawn inside it and pushed back through the teacher's CDF returns that
+    token, which is the whole contract PTP rests on. Checked by the caller.
+    """
+    truth = torch.cat(gt, dim=1)
+    logits = teacher(labels, var_input(vae, gt, device), truth=truth).float()
+    probs = torch.softmax(logits, dim=-1)
+    cdf = probs.cumsum(dim=-1)
+    tgt = truth.unsqueeze(-1)
+    right = cdf.gather(2, tgt).squeeze(2)
+    return right - probs.gather(2, tgt).squeeze(2), right, probs
+
+
 def main():
     import argparse
     import time
