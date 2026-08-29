@@ -42,8 +42,53 @@ def parse_args():
     p.add_argument("--split", type=str, default="train", choices=["train", "test"])
     p.add_argument("--limit", type=int, default=0, help="0 uses the whole split")
     p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--ordering", type=str, default="vocab",
+                   choices=["vocab", "likelihood"],
+                   help="which order the CDF u addresses runs in. 'vocab' walks "
+                        "the codebook by id, so where a token's interval sits is "
+                        "arbitrary and the argmax can be anywhere -- the student "
+                        "has to internalise a lookup table with no structure. "
+                        "'likelihood' walks it by descending probability, which "
+                        "makes 'u below the largest probability' mean 'emit the "
+                        "argmax' at every position, a rule that does not depend "
+                        "on context. ptp-on-alps/extract-auxiliaries calls this "
+                        "likelihood_ordered and packs the same quantity")
     p.add_argument("--out", type=str, required=True)
     return p.parse_args()
+
+
+def interval(probs, target, ordering):
+    """[left, right) the teacher gives the target, in the requested order.
+
+    Under 'vocab' this is the plain cumulative sum: the interval sits wherever
+    the token's id happens to fall. Under 'likelihood' the left edge is the mass
+    of everything strictly likelier, so the most probable token always owns
+    [0, p_max) no matter which token that is.
+    """
+    if ordering == "vocab":
+        cdf = probs.cumsum(-1)
+        right = cdf.gather(2, target).squeeze(2)
+        return right - probs.gather(2, target).squeeze(2), right
+    order = probs.argsort(dim=-1, descending=True)
+    sorted_probs = probs.gather(2, order)
+    cdf = sorted_probs.cumsum(-1)
+    rank = (order == target).float().argmax(dim=-1, keepdim=True)
+    right = cdf.gather(2, rank).squeeze(2)
+    return right - sorted_probs.gather(2, rank).squeeze(2), right
+
+
+def invert(probs, u, ordering):
+    """Which token u selects, in the same order the intervals were built in."""
+    if ordering == "vocab":
+        cdf = probs.cumsum(-1)
+        return torch.searchsorted(cdf.contiguous(),
+                                  u.unsqueeze(-1).contiguous()).squeeze(-1)
+    order = probs.argsort(dim=-1, descending=True)
+    cdf = probs.gather(2, order).cumsum(-1)
+    rank = torch.searchsorted(cdf.contiguous(),
+                              u.unsqueeze(-1).contiguous()).clamp(
+                                  max=probs.shape[-1] - 1)
+    return order.gather(2, rank).squeeze(-1)
 
 
 def main():
@@ -85,11 +130,10 @@ def main():
         chunk = tokens[start:start + args.batch_size].long().to(device)
         ids = torch.cat([torch.full((chunk.shape[0], 1), num_codes, device=device), chunk], 1)
         probs = torch.softmax(teacher(input_ids=ids).logits[:, :-1].float(), dim=-1)
-        cdf = probs.cumsum(-1)
         target = chunk.unsqueeze(-1)
-        right = cdf.gather(2, target).squeeze(2)
-        lefts.append((right - probs.gather(2, target).squeeze(2)).cpu())
-        rights.append(right.cpu())
+        l, r = interval(probs, target, args.ordering)
+        lefts.append(l.cpu())
+        rights.append(r.cpu())
     left, right = torch.cat(lefts), torch.cat(rights)
     width = right - left
     print(f"bin width: median={width.median():.4f} mean={width.mean():.4f} "
@@ -100,10 +144,10 @@ def main():
     probe = slice(0, min(256, tokens.shape[0]))
     chunk = tokens[probe].long().to(device)
     ids = torch.cat([torch.full((chunk.shape[0], 1), num_codes, device=device), chunk], 1)
-    cdf = torch.softmax(teacher(input_ids=ids).logits[:, :-1].float(), -1).cumsum(-1)
+    probs = torch.softmax(teacher(input_ids=ids).logits[:, :-1].float(), -1)
     u = (left[probe].to(device) + width[probe].to(device)
          * torch.rand(chunk.shape, device=device))
-    recovered = torch.searchsorted(cdf.contiguous(), u.unsqueeze(-1).contiguous()).squeeze(-1)
+    recovered = invert(probs, u, args.ordering)
     rate = (recovered == chunk).float().mean().item()
     print(f"oracle inverse-CDF recovers the true token: {rate:.4f}")
     assert rate > 0.99, "bin edges do not describe this teacher"
@@ -117,7 +161,7 @@ def main():
         "config": {
             "source": f"{args.dataset}-{args.split}", "num_codes": num_codes,
             "seq_len": tokens.shape[1], "num_images": tokens.shape[0],
-            "order": meta["order"],
+            "order": meta["order"], "ordering": args.ordering,
         },
     }
     out = Path(args.out).expanduser()
