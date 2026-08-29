@@ -43,7 +43,7 @@ def parse_args():
     p.add_argument("--limit", type=int, default=0, help="0 uses the whole split")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--ordering", type=str, default="vocab",
-                   choices=["vocab", "likelihood"],
+                   choices=["vocab", "likelihood", "global"],
                    help="which order the CDF u addresses runs in. 'vocab' walks "
                         "the codebook by id, so where a token's interval sits is "
                         "arbitrary and the argmax can be anywhere -- the student "
@@ -57,7 +57,31 @@ def parse_args():
     return p.parse_args()
 
 
-def interval(probs, target, ordering):
+def global_order(teacher, tokens, bos, device, batch_size, limit=4096):
+    """One permutation of the codebook, by average probability over the corpus.
+
+    Per-position likelihood ordering makes u address a rank, and the map from
+    rank to code is then a different permutation at every position. This keeps
+    one permutation for all of them.
+    """
+    total = None
+    seen = 0
+    for start in range(0, min(limit, tokens.shape[0]), batch_size):
+        chunk = tokens[start:start + batch_size].long().to(device)
+        ids = torch.cat([torch.full((chunk.shape[0], 1), bos, device=device), chunk], 1)
+        probs = torch.softmax(teacher(input_ids=ids).logits[:, :-1].float(), -1)
+        s = probs.sum(dim=(0, 1))
+        total = s if total is None else total + s
+        seen += probs.shape[0] * probs.shape[1]
+    mean = total / seen
+    order = torch.argsort(mean, descending=True)
+    print(f"global order from {seen} positions; the most frequent code takes "
+          f"{float(mean[order[0]]):.4f} of the mass on average, the least "
+          f"{float(mean[order[-1]]):.2e}")
+    return order
+
+
+def interval(probs, target, ordering, order=None):
     """[left, right) the teacher gives the target, in the requested order.
 
     Under 'vocab' this is the plain cumulative sum: the interval sits wherever
@@ -69,26 +93,36 @@ def interval(probs, target, ordering):
         cdf = probs.cumsum(-1)
         right = cdf.gather(2, target).squeeze(2)
         return right - probs.gather(2, target).squeeze(2), right
-    order = probs.argsort(dim=-1, descending=True)
-    sorted_probs = probs.gather(2, order)
+    if ordering == "likelihood":
+        perm = probs.argsort(dim=-1, descending=True)
+        sorted_probs = probs.gather(2, perm)
+        rank = (perm == target).float().argmax(dim=-1, keepdim=True)
+    else:                                     # one permutation for every position
+        sorted_probs = probs[..., order]
+        rank = torch.argsort(order)[target.squeeze(-1)].unsqueeze(-1)
     cdf = sorted_probs.cumsum(-1)
-    rank = (order == target).float().argmax(dim=-1, keepdim=True)
     right = cdf.gather(2, rank).squeeze(2)
     return right - sorted_probs.gather(2, rank).squeeze(2), right
 
 
-def invert(probs, u, ordering):
+def invert(probs, u, ordering, order=None):
     """Which token u selects, in the same order the intervals were built in."""
     if ordering == "vocab":
         cdf = probs.cumsum(-1)
         return torch.searchsorted(cdf.contiguous(),
                                   u.unsqueeze(-1).contiguous()).squeeze(-1)
-    order = probs.argsort(dim=-1, descending=True)
-    cdf = probs.gather(2, order).cumsum(-1)
+    if ordering == "likelihood":
+        perm = probs.argsort(dim=-1, descending=True)
+        cdf = probs.gather(2, perm).cumsum(-1)
+        rank = torch.searchsorted(cdf.contiguous(),
+                                  u.unsqueeze(-1).contiguous()).clamp(
+                                      max=probs.shape[-1] - 1)
+        return perm.gather(2, rank).squeeze(-1)
+    cdf = probs[..., order].cumsum(-1)
     rank = torch.searchsorted(cdf.contiguous(),
                               u.unsqueeze(-1).contiguous()).clamp(
                                   max=probs.shape[-1] - 1)
-    return order.gather(2, rank).squeeze(-1)
+    return order[rank.squeeze(-1)]
 
 
 def main():
@@ -125,13 +159,16 @@ def main():
     # entry j belongs to input_ids[j+1], so the array is one shorter than the
     # sequence fed to the model.
     teacher, _ = build(args.teacher_ckpt, device=device, dtype=torch.float32)
+    gorder = None
+    if args.ordering == "global":
+        gorder = global_order(teacher, tokens, num_codes, device, args.batch_size)
     lefts, rights = [], []
     for start in range(0, tokens.shape[0], args.batch_size):
         chunk = tokens[start:start + args.batch_size].long().to(device)
         ids = torch.cat([torch.full((chunk.shape[0], 1), num_codes, device=device), chunk], 1)
         probs = torch.softmax(teacher(input_ids=ids).logits[:, :-1].float(), dim=-1)
         target = chunk.unsqueeze(-1)
-        l, r = interval(probs, target, args.ordering)
+        l, r = interval(probs, target, args.ordering, gorder)
         lefts.append(l.cpu())
         rights.append(r.cpu())
     left, right = torch.cat(lefts), torch.cat(rights)
@@ -147,7 +184,7 @@ def main():
     probs = torch.softmax(teacher(input_ids=ids).logits[:, :-1].float(), -1)
     u = (left[probe].to(device) + width[probe].to(device)
          * torch.rand(chunk.shape, device=device))
-    recovered = invert(probs, u, args.ordering)
+    recovered = invert(probs, u, args.ordering, gorder)
     rate = (recovered == chunk).float().mean().item()
     print(f"oracle inverse-CDF recovers the true token: {rate:.4f}")
     assert rate > 0.99, "bin edges do not describe this teacher"
@@ -162,6 +199,7 @@ def main():
             "source": f"{args.dataset}-{args.split}", "num_codes": num_codes,
             "seq_len": tokens.shape[1], "num_images": tokens.shape[0],
             "order": meta["order"], "ordering": args.ordering,
+            "global_order": None if gorder is None else gorder.cpu(),
         },
     }
     out = Path(args.out).expanduser()
