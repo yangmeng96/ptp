@@ -38,3 +38,41 @@ class ConfigurableAuxSampling(ParallelSamplingLightningModule):
             z = torch.distributions.Beta(sample_on, sample_on).sample(
                 left_bin_edges.shape).to(left_bin_edges.device)
         return left_bin_edges + (right_bin_edges - left_bin_edges) * z
+
+class SphereInitAuxSampling(ConfigurableAuxSampling):
+    """ConfigurableAuxSampling with the u embedding table set to the sphere.
+
+    The Voronoi cells make neighbouring auxiliary ids select geometrically
+    related tokens, but a randomly initialised RoundingEmbedding table does not
+    know two ids are neighbours -- the geometry lives in the assignment and
+    never reaches the model. The upstream scheme has the model read the frozen
+    sphere vectors themselves. This rebuilds the same sphere (same seed, same
+    construction as prepare_voronoi_tokens.py) and writes it into the table;
+    the mask row keeps its random initialisation, as upstream's mask_auxiliary
+    is learned. `freeze_sphere` pins the cell rows the way upstream freezes the
+    sphere; the mask row stays trainable either way.
+    """
+
+    def __init__(self, *args, sphere_K: int = 512, sphere_seed: int = 0,
+                 freeze_sphere: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        import torch.nn.functional as F
+        table = self.model.u_embed.embedding.weight
+        K, dim = sphere_K, table.shape[1]
+        assert table.shape[0] == K + 1, (
+            f"expected {K}+1 bins (cells + mask), got {table.shape[0]}")
+        g = torch.Generator(device="cpu").manual_seed(sphere_seed)
+        sphere = F.normalize(torch.randn(K, dim, generator=g), dim=-1)
+        with torch.no_grad():
+            table[:K] = sphere.to(table.device, table.dtype)
+        if freeze_sphere:
+            # One parameter cannot be half-frozen; a hook zeroes the cell rows'
+            # gradient instead, leaving the mask row trainable.
+            def clamp(grad):
+                grad = grad.clone()
+                grad[:K] = 0
+                return grad
+            table.register_hook(clamp)
+        print(f"u embedding: {K} rows set to the seed-{sphere_seed} sphere, "
+              f"mask row learned, frozen={freeze_sphere}")
+
