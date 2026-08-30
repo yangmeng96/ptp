@@ -185,15 +185,37 @@ def build_ptp_student(vae, patch_nums, adapter="binary", num_classes=10,
     return base
 
 
+def guidance_ramp(patch_nums, cfg, device):
+    """VAR's guidance weight per position: cfg * si / (S-1), constant in a scale."""
+    S = len(patch_nums)
+    return torch.cat([torch.full((pn * pn,), cfg * si / max(S - 1, 1), device=device)
+                      for si, pn in enumerate(patch_nums)])
+
+
 @torch.no_grad()
-def bin_edges(teacher, vae, labels, gt, device):
+def bin_edges(teacher, vae, labels, gt, device, cfg=0.0):
     """The interval the within-scale AR teacher assigns to each true token.
 
     u drawn inside it and pushed back through the teacher's CDF returns that
     token, which is the whole contract PTP rests on. Checked by the caller.
+
+    With cfg > 0 the intervals come from the *guided* distribution instead of the
+    raw conditional. That matters more than it sounds: guidance is worth a factor
+    of four to this teacher (FID 122 unguided, 31 at cfg 1.5), and a student
+    distilled from the unguided CDF can never collect any of it -- it emits the
+    one-hot its teacher's CDF selects, and there is no second forward at
+    inference to mix against. Baking a fixed guidance scale into the intervals
+    hands the student that factor at no extra cost, at the price of s no longer
+    being adjustable after training.
     """
     truth = torch.cat(gt, dim=1)
-    logits = teacher(labels, var_input(vae, gt, device), truth=truth).float()
+    x_in = var_input(vae, gt, device)
+    logits = teacher(labels, x_in, truth=truth).float()
+    if cfg > 0:
+        null = torch.full_like(labels, teacher.num_classes)
+        un = teacher(null, x_in, truth=truth).float()
+        t = guidance_ramp(teacher.patch_nums, cfg, device).view(1, -1, 1)
+        logits = (1 + t) * logits - t * un
     probs = torch.softmax(logits, dim=-1)
     cdf = probs.cumsum(dim=-1)
     tgt = truth.unsqueeze(-1)

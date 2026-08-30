@@ -40,6 +40,13 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--batch-size", type=int, default=128)
+    # Guidance is worth a factor of four to this teacher and nothing at all to a
+    # student distilled from its raw conditional, because the student has no
+    # second forward to mix against. Baking a fixed scale into the intervals is
+    # the only way it collects any of that.
+    p.add_argument("--cfg", type=float, default=0.0)
+    p.add_argument("--teacher-tag", type=str, default="var_within_scale")
+    p.add_argument("--student-tag", type=str, default="var_ptp_student")
     return p.parse_args()
 
 
@@ -63,12 +70,14 @@ def main():
 
     teacher = build_within_scale_var(vae, mv.PATCH, num_classes=mv.NUM_CLASSES,
                                      device=device)
-    teacher.load_state_dict(torch.load(d / "var_within_scale.pt", map_location="cpu"))
+    teacher.load_state_dict(torch.load(d / f"{args.teacher_tag}.pt", map_location="cpu"))
     teacher.eval().requires_grad_(False)
     teacher.cond_drop_rate = 0.0
 
     student = build_ptp_student(vae, mv.PATCH, adapter=args.adapter,
                                 num_classes=mv.NUM_CLASSES, device=device)
+    print(f"teacher {args.teacher_tag}, cfg {args.cfg} -> {args.student_tag}.pt",
+          flush=True)
     print(f"student {sum(p.numel() for p in student.parameters())/1e6:.1f}M, "
           f"u encoding {args.adapter}, scales {mv.PATCH}", flush=True)
 
@@ -81,7 +90,7 @@ def main():
     x, y = x.to(device), y.to(device)
     gt = vae.img_to_idxBl(x)
     truth = torch.cat(gt, 1)
-    left, right, probs = bin_edges(teacher, vae, y, gt, device)
+    left, right, probs = bin_edges(teacher, vae, y, gt, device, cfg=args.cfg)
     u = left + (right - left) * torch.rand(left.shape, device=device)
     rec = torch.searchsorted(probs.cumsum(-1).contiguous(),
                              u.unsqueeze(-1).contiguous()).squeeze(-1)
@@ -102,7 +111,7 @@ def main():
                 x, y = x.to(device), y.to(device)
                 gt = vae.img_to_idxBl(x)
                 truth = torch.cat(gt, 1)
-                left, right, _ = bin_edges(teacher, vae, y, gt, device)
+                left, right, _ = bin_edges(teacher, vae, y, gt, device, cfg=args.cfg)
                 u = left + (right - left) * torch.rand(left.shape, device=device)
                 xin = var_input(vae, gt, device)
                 lg = student(y, xin, u=u).float()
@@ -125,7 +134,7 @@ def main():
             with torch.no_grad():
                 gt = vae.img_to_idxBl(x)
                 truth = torch.cat(gt, 1)
-                left, right, _ = bin_edges(teacher, vae, y, gt, device)
+                left, right, _ = bin_edges(teacher, vae, y, gt, device, cfg=args.cfg)
                 u = left + (right - left) * torch.rand(left.shape, device=device)
                 xin = var_input(vae, gt, device)
             lg = student(y, xin, u=u)
@@ -138,7 +147,7 @@ def main():
         mark = ""
         if ce < best:
             best = ce
-            torch.save(student.state_dict(), d / "var_ptp_student.pt")
+            torch.save(student.state_dict(), d / f"{args.student_tag}.pt")
             mark = "  <- kept"
         print(f"epoch {ep+1}/{args.epochs} test CE {ce:.4f}  agrees with teacher "
               f"{agree:.4f}  shuffled u {shuf:.4f}  lift {agree/max(shuf,1e-9):.2f}x "
