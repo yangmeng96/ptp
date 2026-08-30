@@ -43,7 +43,7 @@ def parse_args():
     p.add_argument("--limit", type=int, default=0, help="0 uses the whole split")
     p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--ordering", type=str, default="vocab",
-                   choices=["vocab", "likelihood", "global"],
+                   choices=["vocab", "likelihood", "global", "geometric"],
                    help="which order the CDF u addresses runs in. 'vocab' walks "
                         "the codebook by id, so where a token's interval sits is "
                         "arbitrary and the argmax can be anywhere -- the student "
@@ -84,6 +84,41 @@ def global_order(teacher, tokens, bos, device, batch_size, limit=4096):
     print(f"global order from {seen} positions; the most frequent code takes "
           f"{float(mean[order[0]]):.4f} of the mass on average, the least "
           f"{float(mean[order[-1]]):.2e}")
+    return order
+
+
+
+def geometric_order(codebook):
+    """One permutation of the codebook, by a greedy nearest-neighbour tour.
+
+    A 1-D order of points in 256 dimensions cannot make every embedding
+    neighbour adjacent -- measured on LlamaGen's 16,384 codes, the best tour
+    still leaves a median rank distance of 1,203 where adjacency needs 1 to 8,
+    which is the magnitude N^(1-1/d) predicts. What it can do is make the map
+    from u to a code smooth on average, which is a weaker property and the one a
+    trained student might actually use. Greedy rather than spectral because
+    greedy optimises adjacency directly, and adjacency is what an interval-off
+    error lands on.
+    """
+    x = torch.nn.functional.normalize(codebook.float(), dim=-1)
+    n = x.shape[0]
+    dist = torch.cdist(x, x)
+    dist.fill_diagonal_(float("inf"))
+    order = [0]
+    unvisited = torch.ones(n, dtype=torch.bool)
+    unvisited[0] = False
+    for _ in range(n - 1):
+        d = dist[order[-1]].clone()
+        d[~unvisited] = float("inf")
+        nxt = int(d.argmin())
+        order.append(nxt)
+        unvisited[nxt] = False
+    order = torch.tensor(order, dtype=torch.long)
+    rank = torch.argsort(order)
+    nn_rank_gap = (rank[dist.argmin(dim=1)] - rank).abs().float().median()
+    print(f"greedy tour over {n} codes; an embedding nearest neighbour sits "
+          f"{float(nn_rank_gap):.0f} places away in this order "
+          f"(a random order would give about {n/3:.0f})")
     return order
 
 
@@ -166,6 +201,8 @@ def main():
     # sequence fed to the model.
     teacher, _ = build(args.teacher_ckpt, device=device, dtype=torch.float32)
     gorder = None
+    if args.ordering == "geometric":
+        gorder = geometric_order(vqvae.codebook.vq_embs.weight.data).to(device)
     if args.ordering == "global":
         if args.global_order_from:
             src = torch.load(Path(args.global_order_from).expanduser(),
