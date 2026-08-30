@@ -223,8 +223,8 @@ def main():
         print(f"{name:<26} label acc {lab_acc:.4f}   FID {fid:8.3f}   "
               f"spread {spread:.3f}", flush=True)
 
-    print(f"\n===== sampling: top_k={TOP_K} top_p={TOP_P} cfg=0 "
-          f"({'untruncated' if not (TOP_K or TOP_P) else \"VAR's own setting\"}) =====\n",
+    how = "untruncated" if not (TOP_K or TOP_P) else "VAR's own setting"
+    print(f"\n===== sampling: top_k={TOP_K} top_p={TOP_P} cfg=0 ({how}) =====\n",
           flush=True)
     want = torch.arange(10).repeat_interleave(N_SAMPLES // 10)
     lab = want.to(device)
