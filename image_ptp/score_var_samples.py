@@ -183,8 +183,12 @@ def sample_raster_ar(clf_unused=None, n=2000, batch=250, top_k=0, top_p=0.0):
 
 TOP_K, TOP_P = int(os.environ.get('TOP_K', 0)), float(os.environ.get('TOP_P', 0.0))
 CFG = float(os.environ.get('CFG', 0.0))
-STUDENT_TAG = os.environ.get('STUDENT_TAG', 'var_ptp_student')
+STUDENT_TAGS = [t for t in os.environ.get(
+    'STUDENT_TAGS', 'var_ptp_student').split(',') if t]
 TEACHER_TAG = os.environ.get('TEACHER_TAG', 'var_within_scale')
+# Comparing several students means re-running the arms they share; the
+# teacher costs 130 forwards an image at cfg > 0, so skipping it matters.
+ARMS = set(os.environ.get('ARMS', 'raster,par8,ptp,ar8,par2468').split(','))
 
 
 def main():
@@ -291,18 +295,24 @@ def main():
     del var8
     torch.cuda.empty_cache()
 
-    student = build_ptp_student(vae8, mv8.PATCH, adapter="binary",
-                                num_classes=mv8.NUM_CLASSES, device=device)
-    student.load_state_dict(torch.load(Path(mv8.OUT) / f"{STUDENT_TAG}.pt",
-                                       map_location="cpu"))
-    student.eval()
-    student.cond_drop_rate = 0.0
-    with torch.no_grad():
-        img = torch.cat([decode(mv8, vae8, sample_ptp(
-            mv8, vae8, student, lab[i:i + 256])).cpu()
-            for i in range(0, lab.shape[0], 256)])
-    score(f"(1,8) + PTP [{STUDENT_TAG}], 2 fwd", img, want)                # already [-1,1]
-    del student, vae8
+    # Every student is scored in the same run, against the same cached
+    # classifier and the same arms, so the numbers are one table and not several.
+    for tag in STUDENT_TAGS:
+        student = build_ptp_student(vae8, mv8.PATCH, adapter="binary",
+                                    num_classes=mv8.NUM_CLASSES, device=device)
+        student.load_state_dict(torch.load(Path(mv8.OUT) / f"{tag}.pt",
+                                           map_location="cpu"))
+        student.eval()
+        student.cond_drop_rate = 0.0
+        torch.manual_seed(SEED)
+        with torch.no_grad():
+            img = torch.cat([decode(mv8, vae8, sample_ptp(
+                mv8, vae8, student, lab[i:i + 256])).cpu()
+                for i in range(0, lab.shape[0], 256)])
+        score(f"(1,8) + PTP [{tag}], 2 fwd", img, want)      # already [-1,1]
+        del student
+        torch.cuda.empty_cache()
+    del vae8
     torch.cuda.empty_cache()
 
     # The teacher the PTP student was distilled from: its own samples are the
