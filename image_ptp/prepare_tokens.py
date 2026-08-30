@@ -100,7 +100,9 @@ def geometric_order(codebook):
     greedy optimises adjacency directly, and adjacency is what an interval-off
     error lands on.
     """
-    x = torch.nn.functional.normalize(codebook.float(), dim=-1)
+    # 512 x 512 distances; keep the whole tour on the CPU so the bookkeeping
+    # tensors cannot end up on different devices from each other.
+    x = torch.nn.functional.normalize(codebook.detach().float().cpu(), dim=-1)
     n = x.shape[0]
     dist = torch.cdist(x, x)
     dist.fill_diagonal_(float("inf"))
