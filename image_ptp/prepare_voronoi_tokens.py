@@ -96,8 +96,13 @@ def assign_cells(Q, S, K, max_active):
             break
         score = S[tok]                                           # (P, K)
         score = score.masked_fill(taken, float("-inf"))
-        srt = score.argsort(dim=-1, descending=True)             # (P, K)
-        pick = arangeK < q_r[:, None]                            # first quota slots
+        # Only the q_r best matter, and q_r is small once the largest few
+        # targets are placed; a full argsort of K is what made this unusable at
+        # K = 16384, where sorting 16384 entries per position per round dominated
+        # everything else.
+        top = int(q_r.max())
+        srt = score.topk(top, dim=-1).indices                    # (P, top)
+        pick = torch.arange(top, device=device)[None, :] < q_r[:, None]
         chosen = torch.zeros_like(taken)
         chosen.scatter_(1, srt, pick)
         owner = torch.where(chosen, tok[:, None], owner)
