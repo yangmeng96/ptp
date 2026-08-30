@@ -43,6 +43,19 @@ def parse_args():
     p.add_argument("--K", type=int, default=512)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--solver", type=str, default="greedy",
+                   choices=["greedy", "referee"],
+                   help="'greedy' is the local single-pass assignment, fine at "
+                        "K=512. 'referee' calls ptp-on-alps's Triton auction, "
+                        "which is what makes larger K tractable -- the greedy "
+                        "loops once per target with a nonzero quota, and that "
+                        "count grows with K. Both take the same quotas, which "
+                        "were checked elementwise against the referee's own")
+    p.add_argument("--top-m", type=int, default=256,
+                   help="referee only: candidate targets per position. A true "
+                        "token outside this list is masked, so it trades the "
+                        "cost table against the mask rate")
+    p.add_argument("--upstream", type=str, default="/home/mengy13/upstream_ptp")
     p.add_argument("--max-active", type=int, default=128,
                    help="tokens with nonzero quota per position are capped here; "
                         "the effective candidate count is ~32, so 128 is slack")
@@ -92,6 +105,30 @@ def assign_cells(Q, S, K, max_active):
     return owner
 
 
+
+def assign_cells_referee(Q, S, K, top_m, ref_assign):
+    """Quota assignment via the upstream Triton auction; same quotas as greedy.
+
+    The cost table is (positions, top_m, K), which is why top_m has to be
+    bounded. A target outside the shortlist cannot receive auxiliaries, so its
+    positions come back masked.
+    """
+    P, V = Q.shape
+    device = Q.device
+    quota = quotas_from_probs(Q, K)                              # (P, V)
+    tok = quota.argsort(dim=1, descending=True)[:, :top_m]       # (P, top_m)
+    counts = quota.gather(1, tok)
+    # Whatever the shortlist drops has to go somewhere or the quotas will not
+    # sum to K; hand it to the position's largest target, which is where the
+    # rounding noise is least visible.
+    short = K - counts.sum(dim=1)
+    counts[:, 0] += short
+    cost = (-S[tok]).to(torch.bfloat16).contiguous()             # (P, top_m, K)
+    sigma = ref_assign(cost, counts=counts.to(torch.int32), k=8, rounds=3)
+    owner = tok.gather(1, sigma.clamp(0, top_m - 1))
+    return torch.where(sigma < top_m, owner, torch.full_like(owner, -1))
+
+
 def main():
     args = parse_args()
     device = "cuda"
@@ -113,6 +150,12 @@ def main():
     S = (positions @ sphere.T).contiguous()                      # (V, K)
     print(f"head {head}, sphere {K} x {W.shape[1]}, seed {args.seed}")
 
+    ref_assign = None
+    if args.solver == "referee":
+        sys.path.insert(0, args.upstream)
+        from proportional_assignment import assign as ref_assign
+        print(f"solver: upstream auction, top_m {args.top_m}")
+
     payload = torch.load(Path(args.tokens).expanduser(), map_location="cpu")
     tokens = payload["tokens"].long()
     n_seq, seq_len = tokens.shape
@@ -126,7 +169,10 @@ def main():
         Q = torch.softmax(teacher(input_ids=ids).logits[:, :-1, :V].float(),
                           dim=-1).reshape(-1, V)
         truth = t.reshape(-1)
-        owner = assign_cells(Q, S, K, args.max_active)            # (P, K)
+        if ref_assign is not None:
+            owner = assign_cells_referee(Q, S, K, args.top_m, ref_assign)
+        else:
+            owner = assign_cells(Q, S, K, args.max_active)        # (P, K)
         mine = owner == truth[:, None]                            # (P, K)
         count = mine.sum(dim=1)
         # uniform draw within the cell; mask id K where the cell is empty
