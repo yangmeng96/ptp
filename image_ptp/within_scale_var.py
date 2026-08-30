@@ -38,7 +38,8 @@ sys.path.insert(0, str(VAR_ROOT))
 
 
 def build_within_scale_var(vae, patch_nums, num_classes=10, depth=8,
-                           embed_dim=512, heads=8, device="cuda"):
+                           embed_dim=512, heads=8, device="cuda",
+                           drop_path=0.0, dropout=0.0, attn_dropout=0.0):
     from models.var import VAR
 
     class WithinScaleVAR(VAR):
@@ -110,7 +111,8 @@ def build_within_scale_var(vae, patch_nums, num_classes=10, depth=8,
 
     var = WithinScaleVAR(
         vae_local=vae, num_classes=num_classes, depth=depth, embed_dim=embed_dim,
-        num_heads=heads, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.0,
+        num_heads=heads, drop_rate=dropout, attn_drop_rate=attn_dropout,
+        drop_path_rate=drop_path,
         norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1, attn_l2_norm=True,
         patch_nums=patch_nums, flash_if_available=True, fused_if_available=True,
     ).to(device)
@@ -210,6 +212,14 @@ def main():
                    default="/home/mengy13/ptp-image-results/mnist_var_r8")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-4)
+    # The first run had none of these and its test CE turned upward at epoch 10
+    # while train CE kept falling. More epochs on that setting buys nothing.
+    p.add_argument("--drop-path", type=float, default=0.0)
+    p.add_argument("--dropout", type=float, default=0.0)
+    p.add_argument("--attn-dropout", type=float, default=0.0)
+    p.add_argument("--tag", type=str, default="var_within_scale",
+                   help="checkpoint basename, so a retrain cannot clobber the "
+                        "teacher the current student was distilled from")
     args = p.parse_args()
 
     os.environ["PATCH"] = args.patch
@@ -223,7 +233,10 @@ def main():
     vae.load_state_dict(torch.load(args.vqvae, map_location="cpu"))
     vae.eval().requires_grad_(False)
     var = build_within_scale_var(vae, mv.PATCH, num_classes=mv.NUM_CLASSES,
-                                 device=device)
+                                 device=device, drop_path=args.drop_path,
+                                 dropout=args.dropout, attn_dropout=args.attn_dropout)
+    print(f"drop_path {args.drop_path} dropout {args.dropout} "
+          f"attn_dropout {args.attn_dropout} -> {args.tag}.pt", flush=True)
     print(f"within-scale AR VAR: {sum(p.numel() for p in var.parameters())/1e6:.1f}M, "
           f"scales {mv.PATCH}, L={var.L}", flush=True)
 
@@ -267,11 +280,11 @@ def main():
         mark = ""
         if v / m < best:
             best = v / m
-            torch.save(var.state_dict(), out / "var_within_scale.pt")
+            torch.save(var.state_dict(), out / f"{args.tag}.pt")
             mark = "  <- kept"
         print(f"epoch {ep+1}/{args.epochs} train {tot/n:.4f} test {v/m:.4f} "
               f"({time.time()-started:.0f}s){mark}", flush=True)
-    print(f"\nbest {best:.4f} nats/token, written to {out}/var_within_scale.pt")
+    print(f"\nbest {best:.4f} nats/token, written to {out}/{args.tag}.pt")
     print("the parallel VAR on the same tokeniser reaches 2.0618; the gap is what "
           "modelling the within-scale joint recovers, and the ceiling for a PTP "
           "student distilled from this teacher")
