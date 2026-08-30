@@ -87,7 +87,8 @@ def draw(logits, top_k=0, top_p=0.0):
 
 
 @torch.no_grad()
-def sample_within_scale_ar(mv, vae, teacher, labels, top_k=0, top_p=0.0):
+def sample_within_scale_ar(mv, vae, teacher, labels, top_k=0, top_p=0.0,
+                           cfg=0.0):
     """Sample the within-scale AR teacher: one forward per token inside a scale.
 
     This is the ceiling a PTP student distilled from it could reach, measured in
@@ -98,6 +99,10 @@ def sample_within_scale_ar(mv, vae, teacher, labels, top_k=0, top_p=0.0):
     Slot i reads the embedding of the token at i-1 of its own scale, so the
     sequence is filled left to right and the whole forward is repeated; 65 passes
     for this ladder. Slow by construction, and only ever run offline.
+
+    It is guided the way VAR guides itself -- the same null class it was trained
+    to drop to, the same ramp across scales. Without that this arm was the only
+    unguided one in the table, and guidance is worth a factor of three here.
     """
     B = labels.shape[0]
     L = teacher.L
@@ -114,9 +119,15 @@ def sample_within_scale_ar(mv, vae, teacher, labels, top_k=0, top_p=0.0):
             x_in = vae.quantize.idxBl_to_var_input(gt)
             if x_in is None:
                 x_in = torch.zeros(B, 0, vae.Cvae, device=device)
+        # VAR ramps guidance linearly across scales; match it exactly.
+        t = cfg * si / max(len(bounds) - 1, 1)
+        null = torch.full_like(labels, teacher.num_classes)
         for j in range(a, b):
-            logits = teacher(labels, x_in, truth=tokens).float()
-            tokens[:, j] = draw(logits[:, j], top_k, top_p)
+            logits = teacher(labels, x_in, truth=tokens).float()[:, j]
+            if t > 0:
+                un = teacher(null, x_in, truth=tokens).float()[:, j]
+                logits = (1 + t) * logits - t * un
+            tokens[:, j] = draw(logits, top_k, top_p)
     return [tokens[:, a:b] for a, b, _ in bounds]
 
 
@@ -171,6 +182,7 @@ def sample_raster_ar(clf_unused=None, n=2000, batch=250, top_k=0, top_p=0.0):
 
 
 TOP_K, TOP_P = int(os.environ.get('TOP_K', 0)), float(os.environ.get('TOP_P', 0.0))
+CFG = float(os.environ.get('CFG', 0.0))
 
 
 def main():
@@ -251,7 +263,10 @@ def main():
               f"spread {spread:.3f}", flush=True)
 
     how = "untruncated" if not (TOP_K or TOP_P) else "VAR's own setting"
-    print(f"\n===== sampling: top_k={TOP_K} top_p={TOP_P} cfg=0 ({how}) =====\n",
+    print(f"\n===== sampling: top_k={TOP_K} top_p={TOP_P} cfg={CFG} ({how}) ====="
+          "\n      the PTP student takes no cfg: its output is meant to be the\n"
+          "      one-hot the teacher CDF selects, and there is no second pass\n"
+          "      to mix against without changing what it was distilled to be.\n",
           flush=True)
     want = torch.arange(10).repeat_interleave(N_SAMPLES // 10)
     lab = want.to(device)
@@ -267,7 +282,7 @@ def main():
     torch.manual_seed(SEED)
     with torch.no_grad():
         img = torch.cat([var8.autoregressive_infer_cfg(
-            B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=0.0,
+            B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=CFG,
             top_k=TOP_K, top_p=TOP_P).cpu()
             for i in range(0, lab.shape[0], 256)])
     score("(1,8) parallel, 2 fwd", img * 2 - 1, want)     # [0,1] -> [-1,1]
@@ -300,7 +315,7 @@ def main():
     tea.cond_drop_rate = 0.0
     with torch.no_grad():
         img = torch.cat([decode(mv8b, vae8b, sample_within_scale_ar(
-            mv8b, vae8b, tea, lab[i:i + 256], TOP_K, TOP_P)).cpu()
+            mv8b, vae8b, tea, lab[i:i + 256], TOP_K, TOP_P, CFG)).cpu()
             for i in range(0, lab.shape[0], 256)])
     score("(1,8) within-scale AR, 65 fwd", img, want)
     del tea, vae8b
@@ -311,7 +326,7 @@ def main():
     torch.manual_seed(SEED)
     with torch.no_grad():
         img = torch.cat([var2.autoregressive_infer_cfg(
-            B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=0.0,
+            B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=CFG,
             top_k=TOP_K, top_p=TOP_P).cpu()
             for i in range(0, lab.shape[0], 256)])
     score("(1,2,4,8) parallel, 4 fwd", img * 2 - 1, want)
