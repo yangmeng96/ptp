@@ -70,6 +70,42 @@ def frechet(a, b):
     return float(diff.dot(diff) + ca.trace() + cb.trace() - 2 * em.sqrt().sum())
 
 
+
+@torch.no_grad()
+def sample_within_scale_ar(mv, vae, teacher, labels):
+    """Sample the within-scale AR teacher: one forward per token inside a scale.
+
+    This is the ceiling a PTP student distilled from it could reach, measured in
+    the same units as the students rather than in per-token cross-entropy, which
+    is not comparable across ladders of different length: (1,8) costs 94.7 nats
+    an image over 65 tokens where (1,2,4,8) costs 120.8 over 85.
+
+    Slot i reads the embedding of the token at i-1 of its own scale, so the
+    sequence is filled left to right and the whole forward is repeated; 65 passes
+    for this ladder. Slow by construction, and only ever run offline.
+    """
+    B = labels.shape[0]
+    L = teacher.L
+    bounds, cur = [], 0
+    for pn in mv.PATCH:
+        bounds.append((cur, cur + pn * pn, pn))
+        cur += pn * pn
+    tokens = torch.zeros(B, L, dtype=torch.long, device=device)
+    for si, (a, b, pn) in enumerate(bounds):
+        if si == 0:
+            x_in = torch.zeros(B, L - teacher.first_l, vae.Cvae, device=device)
+        else:
+            gt = [tokens[:, s0:s1] for s0, s1, _ in bounds[:si]]
+            x_in = vae.quantize.idxBl_to_var_input(gt)
+            if x_in is None:
+                x_in = torch.zeros(B, 0, vae.Cvae, device=device)
+        for j in range(a, b):
+            logits = teacher(labels, x_in, truth=tokens).float()
+            probs = torch.softmax(logits[:, j], -1)
+            tokens[:, j] = torch.multinomial(probs, 1).squeeze(1)
+    return [tokens[:, a:b] for a, b, _ in bounds]
+
+
 def main():
     torch.manual_seed(SEED)
     from image_ptp import mnist_var as mv_boot     # for mnist_loader only
@@ -157,6 +193,24 @@ def main():
             for i in range(0, lab.shape[0], 256)])
     score("(1,8) + PTP, 2 fwd", img, want)                # already [-1,1]
     del student, vae8
+    torch.cuda.empty_cache()
+
+    # The teacher the PTP student was distilled from: its own samples are the
+    # ceiling, in the same metric.
+    from image_ptp.within_scale_var import build_within_scale_var
+    mv8b, vae8b, _ = load_ladder("1,8", "/home/mengy13/ptp-image-results/mnist_var_r8")
+    tea = build_within_scale_var(vae8b, mv8b.PATCH, num_classes=mv8b.NUM_CLASSES,
+                                 device=device)
+    tea.load_state_dict(torch.load(Path(mv8b.OUT) / "var_within_scale.pt",
+                                   map_location="cpu"))
+    tea.eval()
+    tea.cond_drop_rate = 0.0
+    with torch.no_grad():
+        img = torch.cat([decode(mv8b, vae8b, sample_within_scale_ar(
+            mv8b, vae8b, tea, lab[i:i + 256])).cpu()
+            for i in range(0, lab.shape[0], 256)])
+    score("(1,8) within-scale AR, 65 fwd", img, want)
+    del tea, vae8b
     torch.cuda.empty_cache()
 
     mv2, vae2, var2 = load_ladder("1,2,4,8",
