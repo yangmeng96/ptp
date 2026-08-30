@@ -106,6 +106,45 @@ def sample_within_scale_ar(mv, vae, teacher, labels):
     return [tokens[:, a:b] for a, b, _ in bounds]
 
 
+
+@torch.no_grad()
+def sample_raster_ar(clf_unused=None, n=2000, batch=250):
+    """The ptp-vqvae MNIST AR teacher: 49 tokens, one forward each, no ladder.
+
+    An absolute reference for what a fully autoregressive model reaches on this
+    metric, sampled the same way as everything else -- no guidance, no
+    truncation. It is unconditional, so it gets no label accuracy.
+    """
+    import os as _os
+    from image_ptp.vqvae_ar_hf import build
+    ck = "/home/mengy13/ptp-vqvae/checkpoints/ar_mnist_raster.pt"
+    teacher, meta = build(ck, device=device, dtype=torch.float32)
+    teacher.eval()
+    h, w, bos = meta["h"], meta["w"], meta["num_codes"]
+    seq_len = h * w
+    cwd = _os.getcwd()
+    sys.path.insert(0, "/home/mengy13/ptp-vqvae")
+    _os.chdir("/home/mengy13/ptp-vqvae")
+    from models.ar import seq_to_codes_grid
+    from utils.helper import load_vqvae
+    vq, _ = load_vqvae("mnist", device)
+    _os.chdir(cwd)
+    inv = torch.argsort(meta["perm"]).to(device)
+    out = []
+    for _ in range(0, n, batch):
+        seq = torch.full((batch, 1), bos, dtype=torch.long, device=device)
+        for _ in range(seq_len):
+            p = torch.softmax(teacher(input_ids=seq).logits[:, -1].float(), -1)
+            p[:, bos] = 0
+            seq = torch.cat([seq, torch.multinomial(p, 1)], 1)
+        img = vq.decode(seq_to_codes_grid(seq[:, 1:], inv, h, w)).float()
+        # 28x28 in [-1,1]; the scoring classifier is trained on 32x32
+        out.append(F.pad(img, (2, 2, 2, 2), value=-1.0).cpu())
+    del teacher, vq
+    torch.cuda.empty_cache()
+    return torch.cat(out)[:n]
+
+
 def main():
     torch.manual_seed(SEED)
     from image_ptp import mnist_var as mv_boot     # for mnist_loader only
@@ -170,12 +209,19 @@ def main():
     want = torch.arange(10).repeat_interleave(N_SAMPLES // 10)
     lab = want.to(device)
 
+    img = sample_raster_ar(n=N_SAMPLES)
+    with torch.no_grad():
+        f = torch.cat([clf.features(img[i:i + 256].to(device)).cpu()
+                       for i in range(0, img.shape[0], 256)])
+    print(f"{'raster AR, 49 fwd (uncond)':<30} label acc    n/a   "
+          f"FID {frechet(f, feats_real):8.3f}", flush=True)
+
     mv8, vae8, var8 = load_ladder("1,8", "/home/mengy13/ptp-image-results/mnist_var_r8")
     torch.manual_seed(SEED)
     with torch.no_grad():
         img = torch.cat([var8.autoregressive_infer_cfg(
-            B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=1.0,
-            top_k=100, top_p=0.95).cpu()
+            B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=0.0,
+            top_k=0, top_p=0.0).cpu()
             for i in range(0, lab.shape[0], 256)])
     score("(1,8) parallel, 2 fwd", img * 2 - 1, want)     # [0,1] -> [-1,1]
     del var8
@@ -218,8 +264,8 @@ def main():
     torch.manual_seed(SEED)
     with torch.no_grad():
         img = torch.cat([var2.autoregressive_infer_cfg(
-            B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=1.0,
-            top_k=100, top_p=0.95).cpu()
+            B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=0.0,
+            top_k=0, top_p=0.0).cpu()
             for i in range(0, lab.shape[0], 256)])
     score("(1,2,4,8) parallel, 4 fwd", img * 2 - 1, want)
     print("SCORE_DONE", flush=True)
