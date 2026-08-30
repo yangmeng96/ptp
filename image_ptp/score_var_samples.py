@@ -180,17 +180,26 @@ def main():
     os.environ["OUT"] = "/home/mengy13/ptp-image-results/mnist_var_r8"
 
     # ---- classifier on real MNIST ----
+    ckpt = Path(os.environ.get("CLF_CKPT",
+                               "/home/mengy13/ptp-image-results/var_score_clf.pt"))
     clf = Classifier().to(device)
-    opt = torch.optim.AdamW(clf.parameters(), lr=1e-3, weight_decay=1e-4)
-    train = mv_boot.mnist_loader(True, batch=256)
     test = mv_boot.mnist_loader(False, batch=512, workers=2)
-    for ep in range(8):
-        clf.train()
-        for x, y in train:
-            loss = F.cross_entropy(clf(x.to(device)), y.to(device))
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
+    if ckpt.exists():
+        clf.load_state_dict(torch.load(ckpt, map_location="cpu"))
+        print(f"scoring classifier loaded from {ckpt}", flush=True)
+    else:
+        opt = torch.optim.AdamW(clf.parameters(), lr=1e-3, weight_decay=1e-4)
+        train = mv_boot.mnist_loader(True, batch=256)
+        for ep in range(8):
+            clf.train()
+            for x, y in train:
+                loss = F.cross_entropy(clf(x.to(device)), y.to(device))
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+
+        torch.save(clf.state_dict(), ckpt)
+        print(f"scoring classifier trained and cached to {ckpt}", flush=True)
     clf.eval()
     with torch.no_grad():
         hit = n = 0
