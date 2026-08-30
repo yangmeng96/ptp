@@ -103,47 +103,52 @@ def decode(mv, vae, per_scale):
     return vae.fhat_to_img(f_hat)
 
 
-from torchvision.utils import save_image  # noqa: E402
-OUT = Path("/home/mengy13/ptp-image-results/var_ptp_samples")
-OUT.mkdir(parents=True, exist_ok=True)
-labels = torch.arange(10, device=device).repeat_interleave(PER_CLASS)
+def main():
+    from torchvision.utils import save_image
+    OUT = Path("/home/mengy13/ptp-image-results/var_ptp_samples")
+    OUT.mkdir(parents=True, exist_ok=True)
+    labels = torch.arange(10, device=device).repeat_interleave(PER_CLASS)
 
-# --- (1,8) parallel and (1,8) + PTP ---
-mv8, vae8, var8 = load_ladder("1,8", "/home/mengy13/ptp-image-results/mnist_var_r8")
-torch.manual_seed(SEED)
-save_image(var8.autoregressive_infer_cfg(B=N, label_B=labels, cfg=1.0, top_k=100,
-                                         top_p=0.95),
-           OUT / "a_parallel_1_8.png", nrow=PER_CLASS)
-print("wrote a_parallel_1_8.png (2 forwards, independent within a scale)", flush=True)
-del var8
-torch.cuda.empty_cache()
+    # --- (1,8) parallel and (1,8) + PTP ---
+    mv8, vae8, var8 = load_ladder("1,8", "/home/mengy13/ptp-image-results/mnist_var_r8")
+    torch.manual_seed(SEED)
+    save_image(var8.autoregressive_infer_cfg(B=N, label_B=labels, cfg=1.0, top_k=100,
+                                             top_p=0.95),
+               OUT / "a_parallel_1_8.png", nrow=PER_CLASS)
+    print("wrote a_parallel_1_8.png (2 forwards, independent within a scale)", flush=True)
+    del var8
+    torch.cuda.empty_cache()
 
-from image_ptp.within_scale_var import build_ptp_student  # noqa: E402
-student = build_ptp_student(vae8, mv8.PATCH, adapter="binary",
-                            num_classes=mv8.NUM_CLASSES, device=device)
-student.load_state_dict(torch.load(Path(mv8.OUT) / "var_ptp_student.pt",
-                                   map_location="cpu"))
-student.eval()
-student.cond_drop_rate = 0.0
-save_image(decode(mv8, vae8, sample_ptp(mv8, vae8, student, labels)),
-           OUT / "b_ptp_1_8.png", nrow=PER_CLASS)
-print("wrote b_ptp_1_8.png (2 forwards, each slot reads its own u)", flush=True)
-del student, vae8
-torch.cuda.empty_cache()
+    from image_ptp.within_scale_var import build_ptp_student
+    student = build_ptp_student(vae8, mv8.PATCH, adapter="binary",
+                                num_classes=mv8.NUM_CLASSES, device=device)
+    student.load_state_dict(torch.load(Path(mv8.OUT) / "var_ptp_student.pt",
+                                       map_location="cpu"))
+    student.eval()
+    student.cond_drop_rate = 0.0
+    save_image(decode(mv8, vae8, sample_ptp(mv8, vae8, student, labels)),
+               OUT / "b_ptp_1_8.png", nrow=PER_CLASS)
+    print("wrote b_ptp_1_8.png (2 forwards, each slot reads its own u)", flush=True)
+    del student, vae8
+    torch.cuda.empty_cache()
 
-# --- (1,2,4,8) parallel, the target ---
-mv2, vae2, var2 = load_ladder("1,2,4,8", "/home/mengy13/ptp-image-results/mnist_var_r2")
-torch.manual_seed(SEED)
-save_image(var2.autoregressive_infer_cfg(B=N, label_B=labels, cfg=1.0, top_k=100,
-                                         top_p=0.95),
-           OUT / "c_parallel_1_2_4_8.png", nrow=PER_CLASS)
-print("wrote c_parallel_1_2_4_8.png (4 forwards, the target)", flush=True)
+    # --- (1,2,4,8) parallel, the target ---
+    mv2, vae2, var2 = load_ladder("1,2,4,8", "/home/mengy13/ptp-image-results/mnist_var_r2")
+    torch.manual_seed(SEED)
+    save_image(var2.autoregressive_infer_cfg(B=N, label_B=labels, cfg=1.0, top_k=100,
+                                             top_p=0.95),
+               OUT / "c_parallel_1_2_4_8.png", nrow=PER_CLASS)
+    print("wrote c_parallel_1_2_4_8.png (4 forwards, the target)", flush=True)
 
-# A correctly loaded codebook reconstructs; a random one does not. Check rather
-# than eyeballing three grids for noise.
-xs, _ = next(iter(mv2.mnist_loader(False, 64, 0)))
-rec, _, _ = vae2(xs.to(device))
-psnr = 10 * torch.log10(4.0 / torch.nn.functional.mse_loss(rec, xs.to(device)))
-print(f"sanity: the vae VAR samples through reconstructs at {float(psnr):.1f} dB")
-assert float(psnr) > 15, "the codebook in use is not the trained one"
-print("VARPTP_SAMPLES_DONE", flush=True)
+    # A correctly loaded codebook reconstructs; a random one does not. Check rather
+    # than eyeballing three grids for noise.
+    xs, _ = next(iter(mv2.mnist_loader(False, 64, 0)))
+    rec, _, _ = vae2(xs.to(device))
+    psnr = 10 * torch.log10(4.0 / torch.nn.functional.mse_loss(rec, xs.to(device)))
+    print(f"sanity: the vae VAR samples through reconstructs at {float(psnr):.1f} dB")
+    assert float(psnr) > 15, "the codebook in use is not the trained one"
+    print("VARPTP_SAMPLES_DONE", flush=True)
+
+
+if __name__ == "__main__":
+    main()
