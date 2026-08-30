@@ -36,11 +36,16 @@ SEED = 0
 class Classifier(nn.Module):
     def __init__(self, feat=128):
         super().__init__()
+        # Global average pooling threw away the spatial layout, which is most of
+        # what tells a 6 from a 9; that classifier stalled at 0.944 and the
+        # assertion caught it.
         self.body = nn.Sequential(
-            nn.Conv2d(1, 32, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2),   # 32 -> 16
-            nn.Conv2d(32, 64, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2),  # 16 -> 8
-            nn.Conv2d(64, 128, 3, 1, 1), nn.ReLU(), nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(), nn.Linear(128, feat), nn.ReLU())
+            nn.Conv2d(1, 32, 3, 1, 1), nn.ReLU(),
+            nn.Conv2d(32, 32, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2),   # 32 -> 16
+            nn.Conv2d(32, 64, 3, 1, 1), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2),   # 16 -> 8
+            nn.Conv2d(64, 128, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2),  # 8 -> 4
+            nn.Flatten(), nn.Linear(128 * 4 * 4, feat), nn.ReLU())
         self.head = nn.Linear(feat, 10)
 
     def features(self, x):
@@ -76,7 +81,7 @@ def main():
     opt = torch.optim.AdamW(clf.parameters(), lr=1e-3, weight_decay=1e-4)
     train = mv_boot.mnist_loader(True, batch=256)
     test = mv_boot.mnist_loader(False, batch=512, workers=2)
-    for ep in range(4):
+    for ep in range(8):
         clf.train()
         for x, y in train:
             loss = F.cross_entropy(clf(x.to(device)), y.to(device))
