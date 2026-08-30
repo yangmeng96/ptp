@@ -138,7 +138,8 @@ def main():
     torch.manual_seed(SEED)
     with torch.no_grad():
         img = torch.cat([var8.autoregressive_infer_cfg(
-            B=256, label_B=lab[i:i + 256], cfg=1.0, top_k=100, top_p=0.95).cpu()
+            B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=1.0,
+            top_k=100, top_p=0.95).cpu()
             for i in range(0, lab.shape[0], 256)])
     score("(1,8) parallel, 2 fwd", img * 2 - 1, want)     # [0,1] -> [-1,1]
     del var8
@@ -163,7 +164,8 @@ def main():
     torch.manual_seed(SEED)
     with torch.no_grad():
         img = torch.cat([var2.autoregressive_infer_cfg(
-            B=256, label_B=lab[i:i + 256], cfg=1.0, top_k=100, top_p=0.95).cpu()
+            B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=1.0,
+            top_k=100, top_p=0.95).cpu()
             for i in range(0, lab.shape[0], 256)])
     score("(1,2,4,8) parallel, 4 fwd", img * 2 - 1, want)
     print("SCORE_DONE", flush=True)
