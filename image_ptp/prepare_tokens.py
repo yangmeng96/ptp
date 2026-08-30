@@ -53,6 +53,12 @@ def parse_args():
                         "argmax' at every position, a rule that does not depend "
                         "on context. ptp-on-alps/extract-auxiliaries calls this "
                         "likelihood_ordered and packs the same quantity")
+    p.add_argument("--global-order-from", type=str, default=None,
+                   help="reuse the permutation stored in another payload rather "
+                        "than deriving one here. A split that derives its own "
+                        "gets a different order, and a student trained under one "
+                        "scored under the other is being asked what a different "
+                        "u means")
     p.add_argument("--out", type=str, required=True)
     return p.parse_args()
 
@@ -161,7 +167,14 @@ def main():
     teacher, _ = build(args.teacher_ckpt, device=device, dtype=torch.float32)
     gorder = None
     if args.ordering == "global":
-        gorder = global_order(teacher, tokens, num_codes, device, args.batch_size)
+        if args.global_order_from:
+            src = torch.load(Path(args.global_order_from).expanduser(),
+                             map_location="cpu")
+            gorder = src["config"]["global_order"].to(device)
+            print(f"reusing the global order from {args.global_order_from}")
+        else:
+            gorder = global_order(teacher, tokens, num_codes, device,
+                                  args.batch_size)
     lefts, rights = [], []
     for start in range(0, tokens.shape[0], args.batch_size):
         chunk = tokens[start:start + args.batch_size].long().to(device)
