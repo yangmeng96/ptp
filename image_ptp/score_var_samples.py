@@ -136,13 +136,24 @@ def sample_raster_ar(clf_unused=None, n=2000, batch=250, top_k=0, top_p=0.0):
     teacher.eval()
     h, w, bos = meta["h"], meta["w"], meta["num_codes"]
     seq_len = h * w
-    cwd = _os.getcwd()
-    sys.path.insert(0, "/home/mengy13/ptp-vqvae")
-    _os.chdir("/home/mengy13/ptp-vqvae")
-    from models.ar import seq_to_codes_grid
-    from utils.helper import load_vqvae
-    vq, _ = load_vqvae("mnist", device)
-    _os.chdir(cwd)
+    # ptp-vqvae has its own top-level `models` package, which shadows VAR's for
+    # every import after this one. Put the path back and drop what it loaded.
+    cwd, root = _os.getcwd(), "/home/mengy13/ptp-vqvae"
+    saved = list(sys.path)
+    before = set(sys.modules)
+    sys.path.insert(0, root)
+    _os.chdir(root)
+    try:
+        from models.ar import seq_to_codes_grid
+        from utils.helper import load_vqvae
+        vq, _ = load_vqvae("mnist", device)
+    finally:
+        _os.chdir(cwd)
+        sys.path[:] = saved
+        for m in set(sys.modules) - before:
+            f = getattr(sys.modules[m], "__file__", None) or ""
+            if f.startswith(root):
+                del sys.modules[m]
     inv = torch.argsort(meta["perm"]).to(device)
     out = []
     for _ in range(0, n, batch):
@@ -197,9 +208,16 @@ def main():
     feats_real = torch.cat(feats_real)
     labels_real = torch.cat(labels_real)
 
-    half = feats_real.shape[0] // 2
-    floor = frechet(feats_real[:half], feats_real[half:])
-    print(f"floor: real against real, split in half -> FID {floor:.3f}", flush=True)
+    # MNIST's test set is stored as two differently-sourced blocks, so splitting
+    # it at the midpoint measures that shift rather than sampling noise -- it put
+    # the floor at 89 while a generated arm scored 48. Shuffle first, and draw the
+    # same count the arms use so the small-sample bias is the same one.
+    perm = torch.randperm(feats_real.shape[0], generator=torch.Generator().manual_seed(0))
+    print(f"floor: {N_SAMPLES} real against all real -> "
+          f"FID {frechet(feats_real[perm[:N_SAMPLES]], feats_real):.3f}"
+          f"   (midpoint split, unshuffled: "
+          f"{frechet(feats_real[:feats_real.shape[0]//2], feats_real[feats_real.shape[0]//2:]):.3f}"
+          f" -- that is the block shift, not a floor)", flush=True)
 
     # ---- the three samplers ----
     from image_ptp.sample_var_ptp import load_ladder, sample_ptp, decode
