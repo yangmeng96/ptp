@@ -126,7 +126,7 @@ def main():
                              num_layers=args.num_layers)
         model = GatedFullTransformerModel(
             model_id=inner, dtype=torch.float32, adapter_name=adapter,
-            adapter_kwargs=json.loads(kwargs) if kwargs else None,
+            adapter_kwargs=json.loads(kwargs) if kwargs.strip() else None,
             attn_implementation="flex_attention").to(device).eval()
         state = torch.load(Path(ckpt).expanduser(), map_location="cpu",
                            weights_only=False)["state_dict"]

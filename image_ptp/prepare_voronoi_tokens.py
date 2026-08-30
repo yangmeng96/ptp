@@ -201,6 +201,10 @@ def main():
                               "sphere_seed": args.seed, "head": head,
                               "mask_rate": masked_total / P_total})
     payload["aux_ids"] = aux_ids
+    # The trainer must embed the *same* vectors the assignment used. Rebuilding
+    # them from a seed is not enough: a CUDA generator and a CPU generator with
+    # one seed give different draws, so the two ends silently disagreed.
+    payload["sphere"] = sphere.cpu()
     out = Path(args.out).expanduser()
     torch.save(payload, out)
     print(f"wrote {out} ({out.stat().st_size / 1e6:.1f} MB)")

@@ -46,23 +46,37 @@ class SphereInitAuxSampling(ConfigurableAuxSampling):
     related tokens, but a randomly initialised RoundingEmbedding table does not
     know two ids are neighbours -- the geometry lives in the assignment and
     never reaches the model. The upstream scheme has the model read the frozen
-    sphere vectors themselves. This rebuilds the same sphere (same seed, same
-    construction as prepare_voronoi_tokens.py) and writes it into the table;
-    the mask row keeps its random initialisation, as upstream's mask_auxiliary
-    is learned. `freeze_sphere` pins the cell rows the way upstream freezes the
-    sphere; the mask row stays trainable either way.
+    sphere vectors themselves.
+
+    The vectors are read from the data file that the assignment wrote, not
+    rebuilt from a seed. Rebuilding was wrong: `torch.Generator(device="cuda")`
+    and `torch.Generator(device="cpu")` do not agree on one seed, so the table
+    was being filled with a different sphere than the cells were cut with, and
+    what the earlier run measured was the change in scale -- unit rows against
+    nn.Embedding's N(0,1), whose rows have norm about sqrt(dim) -- rather than
+    any geometry.
+
+    `freeze_sphere` pins the cell rows the way upstream freezes the sphere; the
+    mask row stays trainable either way, since upstream's mask_auxiliary is
+    learned.
     """
 
-    def __init__(self, *args, sphere_K: int = 512, sphere_seed: int = 0,
-                 freeze_sphere: bool = False, **kwargs):
+    def __init__(self, *args, sphere_from: str, freeze_sphere: bool = False,
+                 **kwargs):
         super().__init__(*args, **kwargs)
-        import torch.nn.functional as F
+        from pathlib import Path
+        payload = torch.load(Path(sphere_from).expanduser(), map_location="cpu")
+        sphere = payload.get("sphere")
+        assert sphere is not None, (
+            f"{sphere_from} carries no sphere; regenerate it with a "
+            "prepare_voronoi_tokens.py that stores one")
         table = self.model.u_embed.embedding.weight
-        K, dim = sphere_K, table.shape[1]
+        K = sphere.shape[0]
         assert table.shape[0] == K + 1, (
             f"expected {K}+1 bins (cells + mask), got {table.shape[0]}")
-        g = torch.Generator(device="cpu").manual_seed(sphere_seed)
-        sphere = F.normalize(torch.randn(K, dim, generator=g), dim=-1)
+        assert table.shape[1] == sphere.shape[1], (
+            f"sphere is {sphere.shape[1]}-dimensional, the table is "
+            f"{table.shape[1]}")
         with torch.no_grad():
             table[:K] = sphere.to(table.device, table.dtype)
         if freeze_sphere:
@@ -73,6 +87,5 @@ class SphereInitAuxSampling(ConfigurableAuxSampling):
                 grad[:K] = 0
                 return grad
             table.register_hook(clamp)
-        print(f"u embedding: {K} rows set to the seed-{sphere_seed} sphere, "
+        print(f"u embedding: {K} rows loaded from {sphere_from}, "
               f"mask row learned, frozen={freeze_sphere}")
-
