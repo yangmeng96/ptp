@@ -71,8 +71,23 @@ def frechet(a, b):
 
 
 
+def draw(logits, top_k=0, top_p=0.0):
+    """One token per row, through VAR's own truncation function.
+
+    VAR truncates its sampling at top-k 100 / top-p 0.95; the within-scale
+    teacher was drawing from the untruncated 512-way tail, 64 times per image,
+    so it paid for that tail 64 times over. Calling VAR's helper rather than
+    reimplementing it is what makes the arms identical rather than merely
+    similar -- it mutates its input, hence the clone.
+    """
+    from models.helpers import sample_with_top_k_top_p_
+    return sample_with_top_k_top_p_(
+        logits.float().clone().unsqueeze(1), top_k=top_k, top_p=top_p
+    ).view(-1)
+
+
 @torch.no_grad()
-def sample_within_scale_ar(mv, vae, teacher, labels):
+def sample_within_scale_ar(mv, vae, teacher, labels, top_k=0, top_p=0.0):
     """Sample the within-scale AR teacher: one forward per token inside a scale.
 
     This is the ceiling a PTP student distilled from it could reach, measured in
@@ -101,14 +116,13 @@ def sample_within_scale_ar(mv, vae, teacher, labels):
                 x_in = torch.zeros(B, 0, vae.Cvae, device=device)
         for j in range(a, b):
             logits = teacher(labels, x_in, truth=tokens).float()
-            probs = torch.softmax(logits[:, j], -1)
-            tokens[:, j] = torch.multinomial(probs, 1).squeeze(1)
+            tokens[:, j] = draw(logits[:, j], top_k, top_p)
     return [tokens[:, a:b] for a, b, _ in bounds]
 
 
 
 @torch.no_grad()
-def sample_raster_ar(clf_unused=None, n=2000, batch=250):
+def sample_raster_ar(clf_unused=None, n=2000, batch=250, top_k=0, top_p=0.0):
     """The ptp-vqvae MNIST AR teacher: 49 tokens, one forward each, no ladder.
 
     An absolute reference for what a fully autoregressive model reaches on this
@@ -134,15 +148,18 @@ def sample_raster_ar(clf_unused=None, n=2000, batch=250):
     for _ in range(0, n, batch):
         seq = torch.full((batch, 1), bos, dtype=torch.long, device=device)
         for _ in range(seq_len):
-            p = torch.softmax(teacher(input_ids=seq).logits[:, -1].float(), -1)
-            p[:, bos] = 0
-            seq = torch.cat([seq, torch.multinomial(p, 1)], 1)
+            lg = teacher(input_ids=seq).logits[:, -1].float()
+            lg[:, bos] = -torch.inf
+            seq = torch.cat([seq, draw(lg, top_k, top_p).unsqueeze(1)], 1)
         img = vq.decode(seq_to_codes_grid(seq[:, 1:], inv, h, w)).float()
         # 28x28 in [-1,1]; the scoring classifier is trained on 32x32
         out.append(F.pad(img, (2, 2, 2, 2), value=-1.0).cpu())
     del teacher, vq
     torch.cuda.empty_cache()
     return torch.cat(out)[:n]
+
+
+TOP_K, TOP_P = int(os.environ.get('TOP_K', 0)), float(os.environ.get('TOP_P', 0.0))
 
 
 def main():
@@ -206,10 +223,13 @@ def main():
         print(f"{name:<26} label acc {lab_acc:.4f}   FID {fid:8.3f}   "
               f"spread {spread:.3f}", flush=True)
 
+    print(f"\n===== sampling: top_k={TOP_K} top_p={TOP_P} cfg=0 "
+          f"({'untruncated' if not (TOP_K or TOP_P) else \"VAR's own setting\"}) =====\n",
+          flush=True)
     want = torch.arange(10).repeat_interleave(N_SAMPLES // 10)
     lab = want.to(device)
 
-    img = sample_raster_ar(n=N_SAMPLES)
+    img = sample_raster_ar(n=N_SAMPLES, top_k=TOP_K, top_p=TOP_P)
     with torch.no_grad():
         f = torch.cat([clf.features(img[i:i + 256].to(device)).cpu()
                        for i in range(0, img.shape[0], 256)])
@@ -221,7 +241,7 @@ def main():
     with torch.no_grad():
         img = torch.cat([var8.autoregressive_infer_cfg(
             B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=0.0,
-            top_k=0, top_p=0.0).cpu()
+            top_k=TOP_K, top_p=TOP_P).cpu()
             for i in range(0, lab.shape[0], 256)])
     score("(1,8) parallel, 2 fwd", img * 2 - 1, want)     # [0,1] -> [-1,1]
     del var8
@@ -253,7 +273,7 @@ def main():
     tea.cond_drop_rate = 0.0
     with torch.no_grad():
         img = torch.cat([decode(mv8b, vae8b, sample_within_scale_ar(
-            mv8b, vae8b, tea, lab[i:i + 256])).cpu()
+            mv8b, vae8b, tea, lab[i:i + 256], TOP_K, TOP_P)).cpu()
             for i in range(0, lab.shape[0], 256)])
     score("(1,8) within-scale AR, 65 fwd", img, want)
     del tea, vae8b
@@ -265,7 +285,7 @@ def main():
     with torch.no_grad():
         img = torch.cat([var2.autoregressive_infer_cfg(
             B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=0.0,
-            top_k=0, top_p=0.0).cpu()
+            top_k=TOP_K, top_p=TOP_P).cpu()
             for i in range(0, lab.shape[0], 256)])
     score("(1,2,4,8) parallel, 4 fwd", img * 2 - 1, want)
     print("SCORE_DONE", flush=True)
