@@ -183,6 +183,8 @@ def sample_raster_ar(clf_unused=None, n=2000, batch=250, top_k=0, top_p=0.0):
 
 TOP_K, TOP_P = int(os.environ.get('TOP_K', 0)), float(os.environ.get('TOP_P', 0.0))
 CFG = float(os.environ.get('CFG', 0.0))
+STUDENT_TAG = os.environ.get('STUDENT_TAG', 'var_ptp_student')
+TEACHER_TAG = os.environ.get('TEACHER_TAG', 'var_within_scale')
 
 
 def main():
@@ -291,7 +293,7 @@ def main():
 
     student = build_ptp_student(vae8, mv8.PATCH, adapter="binary",
                                 num_classes=mv8.NUM_CLASSES, device=device)
-    student.load_state_dict(torch.load(Path(mv8.OUT) / "var_ptp_student.pt",
+    student.load_state_dict(torch.load(Path(mv8.OUT) / f"{STUDENT_TAG}.pt",
                                        map_location="cpu"))
     student.eval()
     student.cond_drop_rate = 0.0
@@ -299,7 +301,7 @@ def main():
         img = torch.cat([decode(mv8, vae8, sample_ptp(
             mv8, vae8, student, lab[i:i + 256])).cpu()
             for i in range(0, lab.shape[0], 256)])
-    score("(1,8) + PTP, 2 fwd", img, want)                # already [-1,1]
+    score(f"(1,8) + PTP [{STUDENT_TAG}], 2 fwd", img, want)                # already [-1,1]
     del student, vae8
     torch.cuda.empty_cache()
 
@@ -309,7 +311,7 @@ def main():
     mv8b, vae8b, _ = load_ladder("1,8", "/home/mengy13/ptp-image-results/mnist_var_r8")
     tea = build_within_scale_var(vae8b, mv8b.PATCH, num_classes=mv8b.NUM_CLASSES,
                                  device=device)
-    tea.load_state_dict(torch.load(Path(mv8b.OUT) / "var_within_scale.pt",
+    tea.load_state_dict(torch.load(Path(mv8b.OUT) / f"{TEACHER_TAG}.pt",
                                    map_location="cpu"))
     tea.eval()
     tea.cond_drop_rate = 0.0
@@ -317,7 +319,7 @@ def main():
         img = torch.cat([decode(mv8b, vae8b, sample_within_scale_ar(
             mv8b, vae8b, tea, lab[i:i + 256], TOP_K, TOP_P, CFG)).cpu()
             for i in range(0, lab.shape[0], 256)])
-    score("(1,8) within-scale AR, 65 fwd", img, want)
+    score(f"(1,8) AR [{TEACHER_TAG}], 65 fwd", img, want)
     del tea, vae8b
     torch.cuda.empty_cache()
 
