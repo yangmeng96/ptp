@@ -463,6 +463,10 @@ def stage_loo(steps=4000, eval_every=1000, unfreeze=2, c_var=512):
     print("MNIST_LOO_DONE", flush=True)
 
 
+# The name other modules imported before the loader learned about CIFAR.
+mnist_loader = data_loader
+
+
 if __name__ == "__main__":
     stage = os.environ.get("STAGE", "vqvae")
     if stage == "vqvae":
@@ -475,7 +479,3 @@ if __name__ == "__main__":
         stage_loo(steps=int(os.environ.get("STEPS", 4000)))
     else:
         raise SystemExit(f"unknown STAGE {stage}")
-
-
-# The name every other module imported before the loader learned about CIFAR.
-mnist_loader = data_loader
