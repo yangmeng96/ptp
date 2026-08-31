@@ -34,13 +34,13 @@ SEED = 0
 
 
 class Classifier(nn.Module):
-    def __init__(self, feat=128):
+    def __init__(self, feat=128, in_ch=1):
         super().__init__()
         # Global average pooling threw away the spatial layout, which is most of
         # what tells a 6 from a 9; that classifier stalled at 0.944 and the
         # assertion caught it.
         self.body = nn.Sequential(
-            nn.Conv2d(1, 32, 3, 1, 1), nn.ReLU(),
+            nn.Conv2d(in_ch, 32, 3, 1, 1), nn.ReLU(),
             nn.Conv2d(32, 32, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2),   # 32 -> 16
             nn.Conv2d(32, 64, 3, 1, 1), nn.ReLU(),
             nn.Conv2d(64, 64, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2),   # 16 -> 8
@@ -142,7 +142,8 @@ def sample_raster_ar(clf_unused=None, n=2000, batch=250, top_k=0, top_p=0.0):
     """
     import os as _os
     from image_ptp.vqvae_ar_hf import build
-    ck = "/home/mengy13/ptp-vqvae/checkpoints/ar_mnist_raster.pt"
+    name = "cifar10" if DATASET == "cifar10" else "mnist"
+    ck = f"/home/mengy13/ptp-vqvae/checkpoints/ar_{name}_raster.pt"
     teacher, meta = build(ck, device=device, dtype=torch.float32)
     teacher.eval()
     h, w, bos = meta["h"], meta["w"], meta["num_codes"]
@@ -157,7 +158,7 @@ def sample_raster_ar(clf_unused=None, n=2000, batch=250, top_k=0, top_p=0.0):
     try:
         from models.ar import seq_to_codes_grid
         from utils.helper import load_vqvae
-        vq, _ = load_vqvae("mnist", device)
+        vq, _ = load_vqvae(name, device)
     finally:
         _os.chdir(cwd)
         sys.path[:] = saved
@@ -174,8 +175,9 @@ def sample_raster_ar(clf_unused=None, n=2000, batch=250, top_k=0, top_p=0.0):
             lg[:, bos] = -torch.inf
             seq = torch.cat([seq, draw(lg, top_k, top_p).unsqueeze(1)], 1)
         img = vq.decode(seq_to_codes_grid(seq[:, 1:], inv, h, w)).float()
-        # 28x28 in [-1,1]; the scoring classifier is trained on 32x32
-        out.append(F.pad(img, (2, 2, 2, 2), value=-1.0).cpu())
+        if img.shape[-1] != 32:      # MNIST decodes to 28; CIFAR is already 32
+            img = F.pad(img, (2, 2, 2, 2), value=-1.0)
+        out.append(img.cpu())
     del teacher, vq
     torch.cuda.empty_cache()
     return torch.cat(out)[:n]
@@ -185,6 +187,16 @@ TOP_K, TOP_P = int(os.environ.get('TOP_K', 0)), float(os.environ.get('TOP_P', 0.
 CFG = float(os.environ.get('CFG', 0.0))
 STUDENT_TAGS = [t for t in os.environ.get(
     'STUDENT_TAGS', 'var_ptp_student').split(',') if t]
+DATASET = os.environ.get('DATASET', 'mnist')
+CHANNELS = 3 if DATASET == 'cifar10' else 1
+RES = "/home/mengy13/ptp-image-results"
+DIR_R8 = os.environ.get('DIR_R8', f"{RES}/mnist_var_r8")
+DIR_R2 = os.environ.get('DIR_R2', f"{RES}/mnist_var_r2")
+# This small CNN reaches 0.99 on MNIST and nothing like it on CIFAR; the point of
+# the assertion is to catch a broken classifier, so the bar has to follow the
+# dataset rather than stay at a number only one of them can clear.
+MIN_ACC = float(os.environ.get('MIN_ACC', 0.80 if DATASET == 'cifar10' else 0.98))
+WITH_RASTER = os.environ.get('WITH_RASTER', '1') == '1'
 TEACHER_TAG = os.environ.get('TEACHER_TAG', 'var_within_scale')
 # Comparing several students means re-running the arms they share; the
 # teacher costs 130 forwards an image at cfg > 0, so skipping it matters.
@@ -195,12 +207,11 @@ def main():
     torch.manual_seed(SEED)
     from image_ptp import mnist_var as mv_boot     # for mnist_loader only
     os.environ["PATCH"] = "1,8"
-    os.environ["OUT"] = "/home/mengy13/ptp-image-results/mnist_var_r8"
+    os.environ["OUT"] = DIR_R8
 
     # ---- classifier on real MNIST ----
-    ckpt = Path(os.environ.get("CLF_CKPT",
-                               "/home/mengy13/ptp-image-results/var_score_clf.pt"))
-    clf = Classifier().to(device)
+    ckpt = Path(os.environ.get("CLF_CKPT", f"{RES}/var_score_clf_{DATASET}.pt"))
+    clf = Classifier(in_ch=CHANNELS).to(device)
     test = mv_boot.mnist_loader(False, batch=512, workers=2)
     if ckpt.exists():
         clf.load_state_dict(torch.load(ckpt, map_location="cpu"))
@@ -231,7 +242,7 @@ def main():
             labels_real.append(y)
     acc = hit / n
     print(f"classifier test accuracy {acc:.4f}", flush=True)
-    assert acc > 0.98, "the classifier is too weak for its verdicts to mean anything"
+    assert acc > MIN_ACC, "the classifier is too weak for its verdicts to mean anything"
     feats_real = torch.cat(feats_real)
     labels_real = torch.cat(labels_real)
 
@@ -277,14 +288,15 @@ def main():
     want = torch.arange(10).repeat_interleave(N_SAMPLES // 10)
     lab = want.to(device)
 
-    img = sample_raster_ar(n=N_SAMPLES, top_k=TOP_K, top_p=TOP_P)
-    with torch.no_grad():
-        f = torch.cat([clf.features(img[i:i + 256].to(device)).cpu()
-                       for i in range(0, img.shape[0], 256)])
-    print(f"{'raster AR, 49 fwd (uncond)':<30} label acc    n/a   "
-          f"FID {frechet(f, feats_real):8.3f}", flush=True)
+    if WITH_RASTER:
+        img = sample_raster_ar(n=N_SAMPLES, top_k=TOP_K, top_p=TOP_P)
+        with torch.no_grad():
+            f = torch.cat([clf.features(img[i:i + 256].to(device)).cpu()
+                           for i in range(0, img.shape[0], 256)])
+        print(f"{'raster AR (uncond)':<30} label acc    n/a   "
+              f"FID {frechet(f, feats_real):8.3f}", flush=True)
 
-    mv8, vae8, var8 = load_ladder("1,8", "/home/mengy13/ptp-image-results/mnist_var_r8")
+    mv8, vae8, var8 = load_ladder("1,8", DIR_R8)
     torch.manual_seed(SEED)
     with torch.no_grad():
         img = torch.cat([var8.autoregressive_infer_cfg(
@@ -318,7 +330,7 @@ def main():
     # The teacher the PTP student was distilled from: its own samples are the
     # ceiling, in the same metric.
     from image_ptp.within_scale_var import build_within_scale_var
-    mv8b, vae8b, _ = load_ladder("1,8", "/home/mengy13/ptp-image-results/mnist_var_r8")
+    mv8b, vae8b, _ = load_ladder("1,8", DIR_R8)
     tea = build_within_scale_var(vae8b, mv8b.PATCH, num_classes=mv8b.NUM_CLASSES,
                                  device=device)
     tea.load_state_dict(torch.load(Path(mv8b.OUT) / f"{TEACHER_TAG}.pt",
@@ -333,8 +345,7 @@ def main():
     del tea, vae8b
     torch.cuda.empty_cache()
 
-    mv2, vae2, var2 = load_ladder("1,2,4,8",
-                                  "/home/mengy13/ptp-image-results/mnist_var_r2")
+    mv2, vae2, var2 = load_ladder("1,2,4,8", DIR_R2)
     torch.manual_seed(SEED)
     with torch.no_grad():
         img = torch.cat([var2.autoregressive_infer_cfg(

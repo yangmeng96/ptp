@@ -40,6 +40,15 @@ VOCAB = int(os.environ.get("VOCAB", 512))
 CVAE = int(os.environ.get("CVAE", 32))
 IMG = 32
 NUM_CLASSES = 10
+# MNIST and CIFAR-10 differ here only in channel count and where the images come
+# from: both are 32x32 after padding, both have ten classes. Everything else --
+# the quantiser, the ladder, the transformer -- is shared, so the two runs stay
+# comparable and there is one code path to keep correct rather than two.
+DATASET = os.environ.get("DATASET", "mnist")
+CHANNELS = 3 if DATASET == "cifar10" else 1
+# CIFAR without a horizontal flip overfits hard; MNIST must not be flipped at all
+# (it would turn some digits into non-digits), so this follows the dataset.
+AUG = os.environ.get("AUG", "1" if DATASET == "cifar10" else "0") == "1"
 device = "cuda"
 
 
@@ -73,14 +82,17 @@ class ResBlock(nn.Module):
 
 
 class MnistVQVAE(nn.Module):
-    """The attributes VAR reads off its tokeniser: Cvae, vocab_size, quantize."""
+    """The attributes VAR reads off its tokeniser: Cvae, vocab_size, quantize.
+
+    Named for MNIST, used for both; CHANNELS is the only thing that varies.
+    """
 
     def __init__(self, ch=128):
         super().__init__()
         from models.quant import VectorQuantizer2
         self.Cvae, self.vocab_size = CVAE, VOCAB
         self.encoder = nn.Sequential(
-            nn.Conv2d(1, ch // 2, 4, 2, 1), nn.SiLU(),       # 32 -> 16
+            nn.Conv2d(CHANNELS, ch // 2, 4, 2, 1), nn.SiLU(),  # 32 -> 16
             nn.Conv2d(ch // 2, ch, 4, 2, 1),                 # 16 -> 8
             ResBlock(ch), ResBlock(ch),
             nn.GroupNorm(8, ch), nn.SiLU(), nn.Conv2d(ch, CVAE, 1))
@@ -88,7 +100,7 @@ class MnistVQVAE(nn.Module):
             nn.Conv2d(CVAE, ch, 3, 1, 1), ResBlock(ch), ResBlock(ch),
             nn.GroupNorm(8, ch), nn.SiLU(),
             nn.ConvTranspose2d(ch, ch // 2, 4, 2, 1), nn.SiLU(),
-            nn.ConvTranspose2d(ch // 2, 1, 4, 2, 1))
+            nn.ConvTranspose2d(ch // 2, CHANNELS, 4, 2, 1))
         self.quant_conv = nn.Conv2d(CVAE, CVAE, 3, 1, 1)
         self.post_quant_conv = nn.Conv2d(CVAE, CVAE, 3, 1, 1)
         self.quantize = VectorQuantizer2(
@@ -111,14 +123,22 @@ class MnistVQVAE(nn.Module):
         return self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1)
 
 
-def mnist_loader(train=True, batch=256, workers=4):
+def data_loader(train=True, batch=256, workers=4):
     from torchvision import datasets, transforms
-    tfm = transforms.Compose([
-        transforms.Pad(2),                       # 28 -> 32
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))])
-    ds = datasets.MNIST(root="/home/mengy13/ptp-vqvae/data/mnist", train=train,
-                        download=False, transform=tfm)
+    if DATASET == "cifar10":
+        steps = [transforms.RandomHorizontalFlip()] if (train and AUG) else []
+        tfm = transforms.Compose(steps + [
+            transforms.ToTensor(),                          # already 32x32
+            transforms.Normalize((0.5,) * 3, (0.5,) * 3)])
+        ds = datasets.CIFAR10(root="/home/mengy13/ptp-vqvae/data/cifar",
+                              train=train, download=False, transform=tfm)
+    else:
+        tfm = transforms.Compose([
+            transforms.Pad(2),                   # 28 -> 32
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))])
+        ds = datasets.MNIST(root="/home/mengy13/ptp-vqvae/data/mnist", train=train,
+                            download=False, transform=tfm)
     from torch.utils.data import DataLoader
     return DataLoader(ds, batch_size=batch, shuffle=train, num_workers=workers,
                       drop_last=train, persistent_workers=workers > 0)
@@ -143,7 +163,7 @@ def stage_vqvae(epochs=12):
     OUT.mkdir(parents=True, exist_ok=True)
     vae = MnistVQVAE().to(device)
     opt = torch.optim.AdamW(vae.parameters(), lr=3e-4, weight_decay=0.01)
-    ld = mnist_loader(True)
+    ld = data_loader(True)
     print(f"vqvae params {sum(p.numel() for p in vae.parameters())/1e6:.1f}M, "
           f"scales {PATCH}, {sum(p*p for p in PATCH)} tokens", flush=True)
     for ep in range(epochs):
@@ -161,7 +181,7 @@ def stage_vqvae(epochs=12):
             n += x.shape[0]
         vae.eval()
         with torch.no_grad():
-            xs, _ = next(iter(mnist_loader(False, 256, 0)))
+            xs, _ = next(iter(data_loader(False, 256, 0)))
             rec, _, _ = vae(xs.to(device))
             psnr = 10 * torch.log10(4.0 / F.mse_loss(rec, xs.to(device)))
         print(f"epoch {ep+1}/{epochs} loss {tot/n:.4f} test PSNR {float(psnr):.2f} dB",
@@ -177,8 +197,8 @@ def stage_var(epochs=30, depth=8, embed_dim=512):
     vae.eval().requires_grad_(False)
     opt = torch.optim.AdamW(var.parameters(), lr=1e-4, weight_decay=0.05,
                             betas=(0.9, 0.95))
-    ld = mnist_loader(True, batch=128)
-    test = mnist_loader(False, batch=128, workers=2)
+    ld = data_loader(True, batch=128)
+    test = data_loader(False, batch=128, workers=2)
     print(f"var params {sum(p.numel() for p in var.parameters())/1e6:.1f}M, "
           f"L={var.L}", flush=True)
     started = time.time()
@@ -251,7 +271,7 @@ def stage_sample(per_class=10, top_k=100, seed=0):
     # A reconstruction strip, to separate what the tokeniser costs from what the
     # transformer costs: anything the autoencoder cannot represent is a ceiling
     # the sampler could never beat.
-    xs, ys = next(iter(mnist_loader(False, per_class * 2, 0)))
+    xs, ys = next(iter(data_loader(False, per_class * 2, 0)))
     with torch.no_grad():
         rec, _, _ = vae(xs.to(device))
     save_image(torch.cat([xs.to(device), rec]).clamp(-1, 1),
@@ -373,8 +393,8 @@ def stage_loo(steps=4000, eval_every=1000, unfreeze=2, c_var=512):
         {"params": [p for m in arms.values() for p in m.head.parameters()],
          "lr": 3e-4}], weight_decay=0.01)
 
-    train_ld = mnist_loader(True, batch=64)
-    test_ld = mnist_loader(False, batch=64, workers=2)
+    train_ld = data_loader(True, batch=64)
+    test_ld = data_loader(False, batch=64, workers=2)
 
     def var_pass(x, y):
         with torch.no_grad():
@@ -455,3 +475,7 @@ if __name__ == "__main__":
         stage_loo(steps=int(os.environ.get("STEPS", 4000)))
     else:
         raise SystemExit(f"unknown STAGE {stage}")
+
+
+# The name every other module imported before the loader learned about CIFAR.
+mnist_loader = data_loader
