@@ -195,7 +195,7 @@ DIR_R2 = os.environ.get('DIR_R2', f"{RES}/mnist_var_r2")
 # This small CNN reaches 0.99 on MNIST and nothing like it on CIFAR; the point of
 # the assertion is to catch a broken classifier, so the bar has to follow the
 # dataset rather than stay at a number only one of them can clear.
-MIN_ACC = float(os.environ.get('MIN_ACC', 0.80 if DATASET == 'cifar10' else 0.98))
+MIN_ACC = float(os.environ.get('MIN_ACC', 0.85 if DATASET == 'cifar10' else 0.98))
 WITH_RASTER = os.environ.get('WITH_RASTER', '1') == '1'
 TEACHER_TAG = os.environ.get('TEACHER_TAG', 'var_within_scale')
 # Comparing several students means re-running the arms they share; the
@@ -217,15 +217,34 @@ def main():
         clf.load_state_dict(torch.load(ckpt, map_location="cpu"))
         print(f"scoring classifier loaded from {ckpt}", flush=True)
     else:
-        opt = torch.optim.AdamW(clf.parameters(), lr=1e-3, weight_decay=1e-4)
-        train = mv_boot.mnist_loader(True, batch=256)
-        for ep in range(8):
+        # CIFAR needs a real recipe here: random crop as well as flip, many more
+        # epochs, and a schedule. Eight epochs of the MNIST recipe reached 0.758,
+        # and the assertion below rightly refused it.
+        from torchvision import datasets, transforms
+        from torch.utils.data import DataLoader
+        epochs = 60 if DATASET == "cifar10" else 8
+        if DATASET == "cifar10":
+            tfm = transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5,) * 3, (0.5,) * 3)])
+            ds = datasets.CIFAR10(root="/home/mengy13/ptp-vqvae/data/cifar",
+                                  train=True, download=False, transform=tfm)
+            train = DataLoader(ds, batch_size=256, shuffle=True, num_workers=4,
+                               drop_last=True, persistent_workers=True)
+        else:
+            train = mv_boot.mnist_loader(True, batch=256)
+        opt = torch.optim.AdamW(clf.parameters(), lr=1e-3, weight_decay=5e-4)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, epochs * len(train))
+        for ep in range(epochs):
             clf.train()
             for x, y in train:
                 loss = F.cross_entropy(clf(x.to(device)), y.to(device))
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
+                sched.step()
 
         torch.save(clf.state_dict(), ckpt)
         print(f"scoring classifier trained and cached to {ckpt}", flush=True)

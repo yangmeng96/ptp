@@ -144,12 +144,16 @@ def data_loader(train=True, batch=256, workers=4):
                       drop_last=train, persistent_workers=workers > 0)
 
 
+DROP_PATH = float(os.environ.get("DROP_PATH", 0.0))
+DROPOUT = float(os.environ.get("DROPOUT", 0.0))
+
+
 def build_var(depth=8, embed_dim=512, heads=8):
     from models.var import VAR
     vae = MnistVQVAE().to(device)
     var = VAR(vae_local=vae, num_classes=NUM_CLASSES, depth=depth,
-              embed_dim=embed_dim, num_heads=heads, drop_rate=0.0,
-              attn_drop_rate=0.0, drop_path_rate=0.0, norm_eps=1e-6,
+              embed_dim=embed_dim, num_heads=heads, drop_rate=DROPOUT,
+              attn_drop_rate=0.0, drop_path_rate=DROP_PATH, norm_eps=1e-6,
               shared_aln=False, cond_drop_rate=0.1, attn_l2_norm=True,
               patch_nums=PATCH, flash_if_available=True,
               fused_if_available=True).to(device)
