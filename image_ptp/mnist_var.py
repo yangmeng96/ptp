@@ -38,6 +38,11 @@ OUT = Path(os.environ.get("OUT", "/home/mengy13/ptp-image-results/mnist_var"))
 PATCH = tuple(int(x) for x in os.environ.get("PATCH", "1,2,3,4,6,8").split(","))
 VOCAB = int(os.environ.get("VOCAB", 512))
 CVAE = int(os.environ.get("CVAE", 32))
+# Encoder/decoder width. The MNIST recipe carried straight over to CIFAR and
+# reached only ~20 dB there, where real images through the tokeniser and back
+# score FID 1259 against a floor of 2.5 -- every generative arm was measuring
+# that damage rather than its own sampling.
+CH = int(os.environ.get("CH", 128))
 IMG = 32
 NUM_CLASSES = 10
 # MNIST and CIFAR-10 differ here only in channel count and where the images come
@@ -87,7 +92,8 @@ class MnistVQVAE(nn.Module):
     Named for MNIST, used for both; CHANNELS is the only thing that varies.
     """
 
-    def __init__(self, ch=128):
+    def __init__(self, ch=None):
+        ch = CH if ch is None else ch
         super().__init__()
         from models.quant import VectorQuantizer2
         self.Cvae, self.vocab_size = CVAE, VOCAB
@@ -150,7 +156,7 @@ DROPOUT = float(os.environ.get("DROPOUT", 0.0))
 
 def build_var(depth=8, embed_dim=512, heads=8):
     from models.var import VAR
-    vae = MnistVQVAE().to(device)
+    vae = MnistVQVAE(ch=CH).to(device)
     var = VAR(vae_local=vae, num_classes=NUM_CLASSES, depth=depth,
               embed_dim=embed_dim, num_heads=heads, drop_rate=DROPOUT,
               attn_drop_rate=0.0, drop_path_rate=DROP_PATH, norm_eps=1e-6,
@@ -165,11 +171,12 @@ def build_var(depth=8, embed_dim=512, heads=8):
 def stage_vqvae(epochs=12):
     ensure_process_group()
     OUT.mkdir(parents=True, exist_ok=True)
-    vae = MnistVQVAE().to(device)
+    vae = MnistVQVAE(ch=CH).to(device)
     opt = torch.optim.AdamW(vae.parameters(), lr=3e-4, weight_decay=0.01)
     ld = data_loader(True)
     print(f"vqvae params {sum(p.numel() for p in vae.parameters())/1e6:.1f}M, "
-          f"scales {PATCH}, {sum(p*p for p in PATCH)} tokens", flush=True)
+          f"ch {CH}, Cvae {CVAE}, vocab {VOCAB}, scales {PATCH}, "
+          f"{sum(p*p for p in PATCH)} tokens", flush=True)
     for ep in range(epochs):
         vae.train()
         tot = n = 0.0
