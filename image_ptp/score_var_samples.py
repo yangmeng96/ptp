@@ -39,12 +39,16 @@ class Classifier(nn.Module):
         # Global average pooling threw away the spatial layout, which is most of
         # what tells a 6 from a 9; that classifier stalled at 0.944 and the
         # assertion caught it.
+        # Batch norm, because without it this reached 0.8428 on CIFAR against a
+        # 0.85 bar -- and a classifier that weak cannot define a feature space
+        # worth measuring Frechet distances in. MNIST cleared 0.99 either way.
+        def block(i, o, pool=False):
+            layers = [nn.Conv2d(i, o, 3, 1, 1), nn.BatchNorm2d(o), nn.ReLU()]
+            return layers + ([nn.MaxPool2d(2)] if pool else [])
         self.body = nn.Sequential(
-            nn.Conv2d(in_ch, 32, 3, 1, 1), nn.ReLU(),
-            nn.Conv2d(32, 32, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2),   # 32 -> 16
-            nn.Conv2d(32, 64, 3, 1, 1), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2),   # 16 -> 8
-            nn.Conv2d(64, 128, 3, 1, 1), nn.ReLU(), nn.MaxPool2d(2),  # 8 -> 4
+            *block(in_ch, 32), *block(32, 32, pool=True),     # 32 -> 16
+            *block(32, 64), *block(64, 64, pool=True),        # 16 -> 8
+            *block(64, 128), *block(128, 128, pool=True),     # 8 -> 4
             nn.Flatten(), nn.Linear(128 * 4 * 4, feat), nn.ReLU())
         self.head = nn.Linear(feat, 10)
 
@@ -210,7 +214,7 @@ def main():
     os.environ["OUT"] = DIR_R8
 
     # ---- classifier on real MNIST ----
-    ckpt = Path(os.environ.get("CLF_CKPT", f"{RES}/var_score_clf_{DATASET}.pt"))
+    ckpt = Path(os.environ.get("CLF_CKPT", f"{RES}/var_score_clf_{DATASET}_bn.pt"))
     clf = Classifier(in_ch=CHANNELS).to(device)
     test = mv_boot.mnist_loader(False, batch=512, workers=2)
     if ckpt.exists():
