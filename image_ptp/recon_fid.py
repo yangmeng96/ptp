@@ -114,7 +114,9 @@ def main():
                                for i in range(0, f.shape[0], 256)])
                     if head is not None else torch.full_like(labels, -1))
         print(f"{name:<18} {ch:>4} {cvae:>5} {vocab:>6} {float(psnr):8.2f} "
-              f"{frechet(f, f_real):10.3f} {float((pred == labels).float().mean()):10.4f}")
+              f"{frechet(f, f_real):10.3f} "
+              + (f"{float((pred == labels).float().mean()):10.4f}"
+                 if head is not None else f"{'n/a':>10}"))
         del vae
         torch.cuda.empty_cache()
     print("RECON_FID_DONE")
