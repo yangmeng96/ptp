@@ -48,13 +48,25 @@ def main():
     device = "cuda"
     os.environ["DATASET"] = args.dataset
 
-    from image_ptp.score_var_samples import Classifier, frechet
-    ch_in = 3 if args.dataset == "cifar10" else 1
-    clf_path = Path(f"/home/mengy13/ptp-image-results/var_score_clf_{args.dataset}_bn.pt")
-    assert clf_path.exists(), f"{clf_path} missing; run the scorer once to build it"
-    clf = Classifier(in_ch=ch_in).to(device)
-    clf.load_state_dict(torch.load(clf_path, map_location="cpu"))
-    clf.eval()
+    # The project's own small classifier defines a space nothing published can be
+    # read against; InceptionV3's cached weights give the standard one. Both are
+    # available so the switch can be checked rather than assumed.
+    net = os.environ.get("FID_NET", "inception")
+    if net == "inception":
+        from image_ptp.fid_features import InceptionFeatures, frechet
+        ext = InceptionFeatures(device=device)
+        feat = ext
+        head = None
+    else:
+        from image_ptp.score_var_samples import Classifier, frechet
+        ch_in = 3 if args.dataset == "cifar10" else 1
+        clf_path = Path(
+            f"/home/mengy13/ptp-image-results/var_score_clf_{args.dataset}_bn.pt")
+        assert clf_path.exists(), f"{clf_path} missing; run the scorer once first"
+        clf = Classifier(in_ch=ch_in).to(device)
+        clf.load_state_dict(torch.load(clf_path, map_location="cpu"))
+        clf.eval()
+        feat, head = clf.features, clf.head
 
     # Real features once, from the same loader every arm will use.
     os.environ.update(PATCH="1,8", DATASET=args.dataset)
@@ -70,10 +82,10 @@ def main():
     real = torch.cat(real)[:args.images]
     labels = torch.cat(labels)[:args.images]
     with torch.no_grad():
-        f_real = torch.cat([clf.features(real[i:i + 256].to(device)).cpu()
+        f_real = torch.cat([feat(real[i:i + 256].to(device)).cpu()
                             for i in range(0, real.shape[0], 256)])
     print(f"{args.dataset}: {real.shape[0]} held-out images, "
-          f"classifier features {f_real.shape[1]}-d\n")
+          f"{net} features {f_real.shape[1]}-d\n")
     print(f"{'tokeniser':<18} {'ch':>4} {'Cvae':>5} {'vocab':>6} "
           f"{'PSNR dB':>8} {'recon FID':>10} {'label acc':>10}")
 
@@ -96,10 +108,11 @@ def main():
         recs = torch.cat(recs)
         psnr = 10 * torch.log10(torch.tensor(4.0 / (se / n)))   # range is [-1,1]
         with torch.no_grad():
-            f = torch.cat([clf.features(recs[i:i + 256].to(device)).cpu()
+            f = torch.cat([feat(recs[i:i + 256].to(device)).cpu()
                            for i in range(0, recs.shape[0], 256)])
-            pred = torch.cat([clf.head(f[i:i + 256].to(device)).argmax(-1).cpu()
-                              for i in range(0, f.shape[0], 256)])
+            pred = (torch.cat([head(f[i:i + 256].to(device)).argmax(-1).cpu()
+                               for i in range(0, f.shape[0], 256)])
+                    if head is not None else torch.full_like(labels, -1))
         print(f"{name:<18} {ch:>4} {cvae:>5} {vocab:>6} {float(psnr):8.2f} "
               f"{frechet(f, f_real):10.3f} {float((pred == labels).float().mean()):10.4f}")
         del vae
