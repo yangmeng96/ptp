@@ -8,6 +8,11 @@ confirm; a typo in a key name is an error here rather than a run that quietly
 measures the baseline twice.
 
     python -m image_ptp.make_variant_config SRC DST model.aux_sampling=beta ...
+
+A leading `-` deletes a key instead of setting it, for options a class has since
+dropped: `SphereInitAuxSampling` took `sphere_K` when the CIFAR configs were
+written and now requires `sphere_from`, so a config copied forward carries a
+keyword that reaches the parent constructor and raises.
 """
 import sys
 from pathlib import Path
@@ -32,6 +37,16 @@ def get_path(cfg, dotted):
     return node
 
 
+def del_path(cfg, dotted):
+    keys = dotted.split(".")
+    node = cfg
+    for k in keys[:-1]:
+        node = node[k]
+    if keys[-1] not in node:
+        raise KeyError(f"-{dotted}: nothing to delete; have {sorted(node)}")
+    del node[keys[-1]]
+
+
 def parse(v):
     for cast in (int, float):
         try:
@@ -44,8 +59,12 @@ def parse(v):
 def main(argv):
     src, dst, *assigns = argv
     cfg = yaml.safe_load(Path(src).read_text())
-    wanted = {}
+    wanted, removed = {}, []
     for a in assigns:
+        if a.startswith("-"):
+            del_path(cfg, a[1:])
+            removed.append(a[1:])
+            continue
         k, v = a.split("=", 1)
         wanted[k] = parse(v)
         set_path(cfg, k, wanted[k])
@@ -53,6 +72,7 @@ def main(argv):
     Path(dst).write_text(
         f"# Generated from {src} by make_variant_config.\n"
         f"# Overrides: {', '.join(f'{k}={v}' for k, v in wanted.items())}\n"
+        f"# Removed: {', '.join(removed) or '(none)'}\n"
         + yaml.safe_dump(cfg, sort_keys=False))
     check = yaml.safe_load(Path(dst).read_text())
     for k, v in wanted.items():
@@ -60,6 +80,13 @@ def main(argv):
         if got != v:
             raise SystemExit(f"FAILED to set {k}: wanted {v!r}, file has {got!r}")
         print(f"  verified {k} = {got!r}")
+    for k in removed:
+        try:
+            get_path(check, k)
+        except KeyError:
+            print(f"  verified {k} is gone")
+        else:
+            raise SystemExit(f"FAILED to delete {k}: still present")
     print(f"wrote {dst}")
 
 
