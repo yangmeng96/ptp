@@ -66,8 +66,14 @@ def main():
         feats, se, n = [], 0.0, 0
         for i in range(0, reals.shape[0], 32):
             x = reals[i:i + 32].to(device)
-            idxs = vae.img_to_idxBl(x, v_patch_nums=pn)
-            rec = vae.idxBl_to_img(idxs, same_shape=True, last_one=True).clamp(-1, 1)
+            # idxBl_to_img walks self.v_patch_nums, the ladder the quantiser was
+            # constructed with, so it cannot decode a shorter one. Going through
+            # f_to_idxBl_or_fhat with to_fhat=True keeps the ladder that was asked
+            # for and returns the accumulated f_hat directly.
+            f = vae.quant_conv(vae.encoder(x))
+            fhat = vae.quantize.f_to_idxBl_or_fhat(f, to_fhat=True,
+                                                   v_patch_nums=pn)[-1]
+            rec = vae.fhat_to_img(fhat)
             se += float(F.mse_loss(rec, x, reduction="sum"))
             n += x.numel()
             feats.append(ext(rec).cpu())
