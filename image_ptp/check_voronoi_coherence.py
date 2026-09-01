@@ -89,6 +89,24 @@ def main():
               f"{r2/abs(s2) if s2 else 0:7.2f}")
         print(f"\ngreedy vs referee agreement: "
               f"{float((o == o2).float().mean()):.4f}")
+        # The student learns "this cell id, under this prefix, means this token".
+        # That is only transferable from the training file to the test file if
+        # the solver is a function of Q alone. Two calls, same input.
+        o3 = pv.assign_cells_referee(Q, S, K, args.top_m, ref_assign)
+        print(f"referee called twice on the same Q: identical "
+              f"{torch.equal(o2, o3)}, agreement "
+              f"{float((o2 == o3).float().mean()):.4f}")
+        half = Q.shape[0] // 2
+        o4 = torch.cat([pv.assign_cells_referee(Q[:half], S, K, args.top_m, ref_assign),
+                        pv.assign_cells_referee(Q[half:], S, K, args.top_m, ref_assign)])
+        print(f"referee split into two calls:      identical "
+              f"{torch.equal(o2, o4)}, agreement "
+              f"{float((o2 == o4).float().mean()):.4f}")
+        og = pv.assign_cells(Q, S, K, max_active=args.top_m)
+        og2 = pv.assign_cells(Q, S, K, max_active=args.top_m)
+        print(f"greedy called twice on the same Q: identical "
+              f"{torch.equal(og, og2)}, agreement "
+              f"{float((og == og2).float().mean()):.4f}")
     except Exception as e:
         print(f"referee unavailable: {type(e).__name__}: {e}")
     print("COHERENCE_DONE")
