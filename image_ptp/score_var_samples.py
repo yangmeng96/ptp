@@ -319,6 +319,29 @@ def main():
         print(f"{'raster AR (uncond)':<30} label acc    n/a   "
               f"FID {frechet(f, feats_real):8.3f}", flush=True)
 
+    # The tokeniser's own ceiling: real held-out images encoded and decoded, no
+    # generation at all. Every arm decodes through this, so nothing can score
+    # better than it, and on CIFAR the VQVAE reaches only ~20 dB where MNIST
+    # reaches ~24. Without this row there is no way to tell a bad sampler from a
+    # bad codebook.
+    def recon_ceiling(mv, vae, name):
+        """Real held-out images through the tokeniser and back, no generation.
+
+        Every arm decodes through this quantiser, so nothing can score better
+        than it. On CIFAR the VQVAE reaches about 20 dB against MNIST's 24, and
+        without this row a lossy codebook and a bad sampler look identical.
+        """
+        imgs, labs, n = [], [], 0
+        for x, y in mv.data_loader(False, batch=256, workers=2):
+            if n >= N_SAMPLES:
+                break
+            with torch.no_grad():
+                rec = vae(x.to(device))[0].clamp(-1, 1)   # forward = encode,
+            imgs.append(rec.cpu())                        # quantise, decode
+            labs.append(y)
+            n += x.shape[0]
+        score(name, torch.cat(imgs)[:N_SAMPLES], torch.cat(labs)[:N_SAMPLES])
+
     mv8, vae8, var8 = load_ladder("1,8", DIR_R8)
     torch.manual_seed(SEED)
     with torch.no_grad():
@@ -326,6 +349,7 @@ def main():
             B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=CFG,
             top_k=TOP_K, top_p=TOP_P).cpu()
             for i in range(0, lab.shape[0], 256)])
+    recon_ceiling(mv8, vae8, "(1,8) VQVAE recon, 0 fwd")
     score("(1,8) parallel, 2 fwd", img * 2 - 1, want)     # [0,1] -> [-1,1]
     del var8
     torch.cuda.empty_cache()
@@ -375,6 +399,7 @@ def main():
             B=lab[i:i + 256].shape[0], label_B=lab[i:i + 256], cfg=CFG,
             top_k=TOP_K, top_p=TOP_P).cpu()
             for i in range(0, lab.shape[0], 256)])
+    recon_ceiling(mv2, vae2, "(1,2,4,8) VQVAE recon, 0 fwd")
     score("(1,2,4,8) parallel, 4 fwd", img * 2 - 1, want)
     print("SCORE_DONE", flush=True)
 
