@@ -60,6 +60,34 @@ class FourierU(nn.Module):
         return self.proj(torch.cat([u.unsqueeze(-1), a.sin(), a.cos()], -1))
 
 
+class SphereU(nn.Module):
+    """Encode a Voronoi cell by the sphere vector it was cut with.
+
+    A lookup table would be K x dim, and K has to grow with the number of codes
+    that need a nonzero quota -- at 65536 cells that table is larger than the
+    rest of the student. The cells are points on a sphere, so their coordinates
+    are the encoding: neighbouring ids are already near each other in the input,
+    which is the property the assignment was built to have, and the parameter
+    count no longer depends on K at all.
+
+    The mask id -- a position whose true token was given no cell -- gets its own
+    learned vector, as upstream's mask_auxiliary does.
+    """
+
+    def __init__(self, sphere, dim):
+        super().__init__()
+        self.register_buffer("sphere", sphere)
+        self.mask = nn.Parameter(torch.zeros(sphere.shape[1]))
+        self.proj = nn.Sequential(nn.Linear(sphere.shape[1], dim), nn.GELU(),
+                                  nn.Linear(dim, dim))
+
+    def forward(self, ids):
+        K = self.sphere.shape[0]
+        v = self.sphere[ids.clamp(max=K - 1)]
+        v = torch.where((ids == K)[..., None], self.mask.expand_as(v), v)
+        return self.proj(v)
+
+
 class Block(nn.Module):
     def __init__(self, dim, heads):
         super().__init__()
@@ -76,7 +104,7 @@ class Block(nn.Module):
 
 class BlockStudent(nn.Module):
     def __init__(self, patch_nums, scales, vocab=4096, cvae=32, n_class=1000,
-                 dim=512, depth=8, heads=8, n_cells=0):
+                 dim=512, depth=8, heads=8, n_cells=0, sphere=None):
         super().__init__()
         self.patch_nums, self.scales = patch_nums, scales
         L = sum(p * p for p in patch_nums[:scales])
@@ -85,8 +113,12 @@ class BlockStudent(nn.Module):
         # handed out by proximity, so neighbouring ids mean related codes. There
         # is no scalar left to resolve, and a lookup is the whole encoder.
         self.n_cells = n_cells
-        self.u_embed = (nn.Embedding(n_cells + 1, dim) if n_cells
-                        else FourierU(dim))
+        if n_cells and sphere is not None:
+            self.u_embed = SphereU(sphere, dim)
+        elif n_cells:
+            self.u_embed = nn.Embedding(n_cells + 1, dim)
+        else:
+            self.u_embed = FourierU(dim)
         self.lvl = nn.Embedding(scales, dim)
         self.pos = nn.Embedding(L, dim)
         self.cls = nn.Embedding(n_class + 1, dim)
@@ -190,8 +222,10 @@ def main():
 
     cells = int(tr.get("n_cells", 0))
     assert cells == int(va.get("n_cells", 0)), "train and val use different schemes"
+    sphere = tr.get("sphere")
     model = BlockStudent(pn, scales, dim=args.dim, depth=args.depth,
-                         n_cells=cells).to(device)
+                         n_cells=cells,
+                         sphere=None if sphere is None else sphere.float()).to(device)
     print(f"student {sum(p.numel() for p in model.parameters())/1e6:.1f}M, "
           f"L={model.L}, aux={tr.get('aux', 'index')}"
           f"{f' K={cells}' if cells else ''}, "
