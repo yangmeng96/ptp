@@ -75,9 +75,13 @@ def main():
     ds = datasets.ImageFolder(args.data, transform=tfm)
     g = torch.Generator().manual_seed(0)
     sub = Subset(ds, torch.randperm(len(ds), generator=g)[:args.images].tolist())
-    x = torch.cat([b for b, _ in DataLoader(sub, batch_size=32, num_workers=8)])
-    f = vae.quant_conv(vae.encoder(x.to(device)))
-    print(f"{x.shape[0]} images, latent {tuple(f.shape[1:])}, ||f|| = {f.norm():.1f}\n")
+    # ava-m4 is a 16 GB card and the encoder at 256x256 needs 10 GB for a batch
+    # of 256; the latent it produces is small, so only the encoding has to be
+    # chunked.
+    f = torch.cat([vae.quant_conv(vae.encoder(b.to(device))).cpu()
+                   for b, _ in DataLoader(sub, batch_size=16, num_workers=8)]
+                  ).to(device)
+    print(f"{f.shape[0]} images, latent {tuple(f.shape[1:])}, ||f|| = {f.norm():.1f}\n")
 
     # A ceiling that owes nothing to the ladder: quantise f once, at full
     # resolution, straight into the codebook.
