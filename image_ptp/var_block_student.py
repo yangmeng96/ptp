@@ -44,12 +44,15 @@ def scale_causal_mask(patch_nums, scales, device):
 class FourierU(nn.Module):
     """Encode a scalar u with a spread of frequencies, then project.
 
-    Interval widths in this project span four orders of magnitude, so a single
-    linear layer on the raw scalar cannot resolve the narrow ones; a frequency
-    ladder gives the network a basis fine enough to separate them.
+    A sinusoid of frequency F separates u values about 1/F apart, so the ladder's
+    top frequency is a hard resolution limit on everything downstream. The first
+    run capped it at 512 -- a floor of 0.002 -- against intervals whose median is
+    0.00119 and 46.5% of which are narrower than 0.001. The encoder could not
+    distinguish the inputs at all, and the regression head correctly answered
+    with the codebook mean, which is what an error of 1.0 relative was.
     """
 
-    def __init__(self, dim, n_freq=64, max_freq=512.0):
+    def __init__(self, dim, n_freq=160, max_freq=16384.0):
         super().__init__()
         freqs = torch.exp(torch.linspace(0, math.log(max_freq), n_freq))
         self.register_buffer("freqs", freqs)
@@ -58,6 +61,31 @@ class FourierU(nn.Module):
     def forward(self, u):                       # (B, L) -> (B, L, dim)
         a = u.unsqueeze(-1) * self.freqs
         return self.proj(torch.cat([u.unsqueeze(-1), a.sin(), a.cos()], -1))
+
+
+class BinaryU(nn.Module):
+    """The original repo's BinaryFloatEmbedding: u's float32 bit pattern.
+
+    A frequency ladder was the wrong basis here. Its low frequencies do not
+    respond to a small shift at all and drown out the few that do, so at the
+    median interval of 0.00119 two u values that must yield different tokens
+    encoded 85% alike, and the regression head answered with the codebook mean.
+    Bits are flat -- the fine ones count as much as the coarse -- and the float
+    layout keeps 23 bits of relative precision everywhere.
+
+        gap        fourier(512)  fourier(16384)  binary
+        2e-3          0.29           0.91         1.18
+        1e-3          0.15           0.84         1.18
+        1e-4          0.015          0.36         1.15
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+        from ptp.auxiliary_embed import BinaryFloatEmbedding
+        self.inner = BinaryFloatEmbedding(dim)
+
+    def forward(self, u):
+        return self.inner(u.float())
 
 
 class SphereU(nn.Module):
@@ -89,22 +117,26 @@ class SphereU(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, heads):
+    def __init__(self, dim, heads, drop=0.0):
         super().__init__()
         self.n1, self.n2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.attn = nn.MultiheadAttention(dim, heads, batch_first=True,
+                                          dropout=drop)
         self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(),
-                                 nn.Linear(4 * dim, dim))
+                                 nn.Dropout(drop), nn.Linear(4 * dim, dim))
+        self.drop = nn.Dropout(drop)
 
     def forward(self, x, mask):
         h = self.n1(x)
-        x = x + self.attn(h, h, h, attn_mask=~mask, need_weights=False)[0]
+        x = x + self.drop(self.attn(h, h, h, attn_mask=~mask,
+                                    need_weights=False)[0])
         return x + self.mlp(self.n2(x))
 
 
 class BlockStudent(nn.Module):
     def __init__(self, patch_nums, scales, vocab=4096, cvae=32, n_class=1000,
-                 dim=512, depth=8, heads=8, n_cells=0, sphere=None):
+                 dim=512, depth=8, heads=8, n_cells=0, sphere=None,
+                 u_encoding="binary", drop=0.0):
         super().__init__()
         self.patch_nums, self.scales = patch_nums, scales
         L = sum(p * p for p in patch_nums[:scales])
@@ -117,6 +149,8 @@ class BlockStudent(nn.Module):
             self.u_embed = SphereU(sphere, dim)
         elif n_cells:
             self.u_embed = nn.Embedding(n_cells + 1, dim)
+        elif u_encoding == "binary":
+            self.u_embed = BinaryU(dim)
         else:
             self.u_embed = FourierU(dim)
         self.lvl = nn.Embedding(scales, dim)
@@ -125,7 +159,7 @@ class BlockStudent(nn.Module):
         lvl_id = torch.cat([torch.full((p * p,), si)
                             for si, p in enumerate(patch_nums[:scales])])
         self.register_buffer("lvl_id", lvl_id)
-        self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(depth))
+        self.blocks = nn.ModuleList(Block(dim, heads, drop) for _ in range(depth))
         self.norm = nn.LayerNorm(dim)
         self.head_ce = nn.Linear(dim, vocab)
         self.head_mse = nn.Linear(dim, cvae)
@@ -201,13 +235,17 @@ def main():
     ap.add_argument("--gaussian", action="store_true")
     ap.add_argument("--loss", default="both", choices=["ce", "mse", "both"])
     ap.add_argument("--mse-weight", type=float, default=1.0)
-    ap.add_argument("--dim", type=int, default=768)
-    ap.add_argument("--depth", type=int, default=10)
+    ap.add_argument("--dim", type=int, default=512)
+    ap.add_argument("--depth", type=int, default=8)
+    # 75M peaked on validation at epoch 2 of 30 with 200k images
+    ap.add_argument("--drop", type=float, default=0.1)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch-size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4)
     # so the loop can be smoke-tested off the cluster
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--u-encoding", default="binary",
+                    choices=["binary", "fourier"])
     args = ap.parse_args()
     device = args.device
 
@@ -224,12 +262,13 @@ def main():
     assert cells == int(va.get("n_cells", 0)), "train and val use different schemes"
     sphere = tr.get("sphere")
     model = BlockStudent(pn, scales, dim=args.dim, depth=args.depth,
-                         n_cells=cells,
+                         n_cells=cells, u_encoding=args.u_encoding,
+                         drop=args.drop,
                          sphere=None if sphere is None else sphere.float()).to(device)
     print(f"student {sum(p.numel() for p in model.parameters())/1e6:.1f}M, "
           f"L={model.L}, aux={tr.get('aux', 'index')}"
           f"{f' K={cells}' if cells else ''}, "
-          f"u={'gaussian' if args.gaussian else 'uniform'}, "
+          f"u={'gaussian' if args.gaussian else 'uniform'}/{args.u_encoding}, "
           f"loss={args.loss}", flush=True)
     if cells:
         ids = tr["left"]
@@ -248,7 +287,7 @@ def main():
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, args.lr, total_steps=steps,
                                                 pct_start=0.03)
     emb_all = codebook.to(device)
-    best, step = float("inf"), 0
+    best, step = -1.0, 0
     for ep in range(args.epochs):
         perm = torch.randperm(N)
         for i in range(0, N - args.batch_size + 1, args.batch_size):
@@ -270,8 +309,8 @@ def main():
             opt.step(); sched.step(); step += 1
         m = evaluate(model, va, mask, device, args.gaussian, cells=cells)
         mark = ""
-        if m["emberr_real"] < best:
-            best = m["emberr_real"]
+        if m["agree_real"] > best:
+            best = m["agree_real"]
             torch.save(dict(model=model.state_dict(), args=vars(args)), args.out)
             mark = "  <- kept"
         print(f"epoch {ep+1}/{args.epochs}  loss {float(loss):.4f}  "
@@ -279,7 +318,7 @@ def main():
               f"lift {m['agree_real']/max(m['agree_shuf'],1e-9):.2f}x)  "
               f"embErr {m['emberr_real']:.4f} (shuf {m['emberr_shuf']:.4f})"
               f"{mark}", flush=True)
-    print(f"\nbest relative embedding error {best:.4f}, written to {args.out}")
+    print(f"\nbest exact-code agreement {best:.4f}, written to {args.out}")
     print("BLOCK_STUDENT_DONE")
 
 
