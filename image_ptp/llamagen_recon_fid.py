@@ -31,7 +31,8 @@ def main():
     torch.set_grad_enabled(False)
 
     from tokenizer.tokenizer_image.vq_model import VQ_models
-    from image_ptp.fid_features import InceptionFeatures, frechet
+    from image_ptp.fid_features import (InceptionFeatures, frechet,
+                                    check_sample_count)
     vq = VQ_models["VQ-16"](codebook_size=16384, codebook_embed_dim=8).to(device).eval()
     sd = torch.load(args.ckpt, map_location="cpu")
     vq.load_state_dict(sd["model"] if "model" in sd else sd)
@@ -57,6 +58,7 @@ def main():
         f_real.append(ext(x).cpu())
         f_rec.append(ext(rec).cpu())
     psnr = 10 * torch.log10(torch.tensor(4.0 / (se / n)))
+    check_sample_count(len(torch.cat(f_real)), 2048)
     print(f"{n // (3 * 256 * 256)} ImageNet val images at 256x256\n")
     print(f"{'tokeniser':<28} {'levels':>7} {'tokens':>7} {'PSNR dB':>8} {'recon FID':>10}")
     print(f"{'LlamaGen VQ-16':<28} {1:>7} {16 * 16:>7} {float(psnr):8.2f} "

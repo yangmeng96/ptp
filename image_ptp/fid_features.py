@@ -59,3 +59,20 @@ def frechet(a, b):
     half = va @ torch.diag(ea.clamp_min(0).sqrt()) @ va.T
     em = torch.linalg.eigvalsh(half @ cb @ half).clamp_min(0)
     return float(diff.dot(diff) + ca.trace() + cb.trace() - 2 * em.sqrt().sum())
+
+
+def check_sample_count(n, dim):
+    """Frechet distance needs more samples than feature dimensions.
+
+    With 2048-d Inception features and n=2000 the covariance is rank-deficient,
+    and the estimate is not merely biased: the same tokeniser and ladder scored
+    9.579 at n=2000 and 2.251 at n=10000. Anything at or below the feature
+    dimension is refused rather than reported.
+    """
+    if n <= dim:
+        raise ValueError(
+            f"{n} samples for {dim}-d features: the covariance is singular and "
+            f"the distance is meaningless. Use at least ~5x the dimension.")
+    if n < 5 * dim:
+        print(f"  WARNING: {n} samples for {dim}-d features is thin; "
+              f"~{5 * dim} would be safer", flush=True)

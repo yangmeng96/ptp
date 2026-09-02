@@ -34,7 +34,8 @@ def main():
     torch.set_grad_enabled(False)
 
     from models.vqvae import VQVAE
-    from image_ptp.fid_features import InceptionFeatures, frechet
+    from image_ptp.fid_features import (InceptionFeatures, frechet,
+                                    check_sample_count)
     vae = VQVAE(vocab_size=4096, z_channels=32, ch=160, test_mode=True,
                 share_quant_resi=4, v_patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
                 ).to(device).eval()
@@ -72,6 +73,7 @@ def main():
         return torch.cat(feats), psnr
 
     f_real, _ = sweep(None)
+    check_sample_count(f_real.shape[0], f_real.shape[1])
     print(f"{f_real.shape[0]} ImageNet val images at 256x256, "
           f"inception {f_real.shape[1]}-d\n")
     print(f"{'ladder':<28} {'levels':>7} {'tokens':>7} {'PSNR dB':>8} {'recon FID':>10}")
