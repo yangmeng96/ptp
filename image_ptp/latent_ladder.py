@@ -25,30 +25,52 @@ sys.path.insert(0, "/home/mengy13/VAR")
 
 @torch.no_grad()
 def trace(vae, f, patch_nums):
-    """Replay VectorQuantizer2.f_to_idxBl_or_fhat, recording what each scale sees."""
+    """Per-scale residual, taken from VAR's own quantiser rather than a replay.
+
+    to_fhat=True returns the accumulated f_hat after each scale, so the residual
+    entering scale k is f - f_hat[k-1] and nothing has to be reimplemented. An
+    earlier hand-written replay of this loop missed the using_znorm branch --
+    cosine nearest-neighbour rather than L2 -- and reported that the full ladder
+    leaves 67% of the latent unexplained, for a tokeniser whose reconstruction
+    FID is 9.6. Hence the cross-check below rather than trust.
+    """
+    fhats = vae.quantize.f_to_idxBl_or_fhat(f, to_fhat=True,
+                                            v_patch_nums=patch_nums)
+    rows, prev = [], torch.zeros_like(f)
+    for pn, fh in zip(patch_nums, fhats):
+        before = (f - prev).norm().item()
+        after = (f - fh).norm().item()
+        rows.append((pn, before, after))
+        prev = fh
+    return fhats[-1], rows
+
+
+@torch.no_grad()
+def replay(vae, f, patch_nums):
+    """The same loop written out, to be checked against the function above."""
     q = vae.quantize
     B, C, H, W = f.shape
     SN = len(patch_nums)
-    f_rest = f.clone()
-    f_hat = torch.zeros_like(f_rest)
-    rows = []
+    f_rest, f_hat = f.clone(), torch.zeros_like(f)
     for si, pn in enumerate(patch_nums):
-        before = f_rest.norm().item()
-        z = (F.interpolate(f_rest, size=(pn, pn), mode="area")
-             .permute(0, 2, 3, 1).reshape(-1, C)) if si != SN - 1 else \
-            f_rest.permute(0, 2, 3, 1).reshape(-1, C)
-        d = (z.pow(2).sum(1, keepdim=True) + q.embedding.weight.pow(2).sum(1)
-             - 2 * z @ q.embedding.weight.T)
-        idx = d.argmin(1)
-        h = q.embedding(idx).view(B, pn, pn, C).permute(0, 3, 1, 2)
-        if pn != H:
+        last = si == SN - 1
+        z = (f_rest if last else F.interpolate(f_rest, size=(pn, pn), mode="area")
+             ).permute(0, 2, 3, 1).reshape(-1, C)
+        if q.using_znorm:
+            zn = F.normalize(z, dim=-1)
+            idx = (zn @ F.normalize(q.embedding.weight.data.T, dim=0)).argmax(1)
+        else:
+            d = (z.square().sum(1, keepdim=True)
+                 + q.embedding.weight.data.square().sum(1))
+            d.addmm_(z, q.embedding.weight.data.T, alpha=-2, beta=1)
+            idx = d.argmin(1)
+        h = q.embedding(idx.view(B, pn, pn)).permute(0, 3, 1, 2)
+        if not last:
             h = F.interpolate(h, size=(H, W), mode="bicubic")
-        h = q.quant_resi[si / (SN - 1)](h)
+        h = q.quant_resi[si / (SN - 1)](h.contiguous())
         f_hat = f_hat + h
         f_rest = f_rest - h
-        rows.append((pn, before, f_rest.norm().item(),
-                     h.norm().item() / max(before, 1e-9)))
-    return f_hat, rows
+    return f_hat
 
 
 def main():
@@ -88,11 +110,13 @@ def main():
     for spec in args.ladders.split("|"):
         pn = tuple(int(v) for v in spec.split(","))
         f_hat, rows = trace(vae, f, pn)
+        mine = replay(vae, f, pn)
+        gap = (f_hat - mine).abs().max().item()
         rel = ((f - f_hat).norm() / f.norm()).item()
-        print(f"ladder {spec}")
+        print(f"ladder {spec}   (replay matches VAR's own to {gap:.2e})")
         print(f"  final ||f - f_hat|| / ||f|| = {rel:.4f}")
         print(f"  {'scale':>6} {'residual in':>12} {'residual out':>13} {'absorbed':>9}")
-        for p, b, a, frac in rows:
+        for p, b, a in rows:
             print(f"  {p:>6} {b:12.1f} {a:13.1f} {1 - a / b:8.1%}")
         print()
     print("LATENT_LADDER_DONE")
