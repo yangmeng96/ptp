@@ -76,12 +76,17 @@ class Block(nn.Module):
 
 class BlockStudent(nn.Module):
     def __init__(self, patch_nums, scales, vocab=4096, cvae=32, n_class=1000,
-                 dim=512, depth=8, heads=8):
+                 dim=512, depth=8, heads=8, n_cells=0):
         super().__init__()
         self.patch_nums, self.scales = patch_nums, scales
         L = sum(p * p for p in patch_nums[:scales])
         self.L = L
-        self.u_embed = FourierU(dim)
+        # A Voronoi auxiliary is already discrete -- an id into cells that were
+        # handed out by proximity, so neighbouring ids mean related codes. There
+        # is no scalar left to resolve, and a lookup is the whole encoder.
+        self.n_cells = n_cells
+        self.u_embed = (nn.Embedding(n_cells + 1, dim) if n_cells
+                        else FourierU(dim))
         self.lvl = nn.Embedding(scales, dim)
         self.pos = nn.Embedding(L, dim)
         self.cls = nn.Embedding(n_class + 1, dim)
@@ -104,17 +109,22 @@ class BlockStudent(nn.Module):
         return self.head_ce(x), self.head_mse(x)
 
 
-def draw_u(left, right, gaussian):
+def draw_u(left, right, gaussian, cells=0):
     """Uniform inside the token's interval; the marginal is then U(0,1), which is
     what inference draws from. Gaussian coding is Phi^-1 of that -- a monotone
     reparameterisation, so which interval a draw falls in is unchanged."""
+    if cells:
+        # The draw already happened when the cell was picked from the ones its
+        # token owns; at inference an id is drawn uniformly instead, and the two
+        # match marginally because cells are allotted in proportion to p.
+        return left.long()
     u = left + (right - left) * torch.rand_like(left)
     if gaussian:
         u = torch.erfinv(2 * u.clamp(1e-6, 1 - 1e-6) - 1) * math.sqrt(2)
     return u
 
 
-def evaluate(model, data, mask, device, gaussian, n=4096):
+def evaluate(model, data, mask, device, gaussian, n=4096, cells=0):
     """Exact-code agreement, and how far the emitted embedding lands.
 
     `agree` is PTP's own criterion and demands the identical code. `embed err`
@@ -134,7 +144,7 @@ def evaluate(model, data, mask, device, gaussian, n=4096):
     out = {}
     with torch.no_grad():
         for name, shuffle in (("real", False), ("shuf", True)):
-            u = draw_u(left, right, gaussian)
+            u = draw_u(left, right, gaussian, cells)
             if shuffle:
                 u = u[torch.randperm(u.shape[0], device=device)]
             ce, ms = model(u, lab, mask)
@@ -178,14 +188,24 @@ def main():
     tr["codebook"] = va["codebook"] = codebook
     mask = scale_causal_mask(pn, scales, device)
 
-    model = BlockStudent(pn, scales, dim=args.dim, depth=args.depth).to(device)
+    cells = int(tr.get("n_cells", 0))
+    assert cells == int(va.get("n_cells", 0)), "train and val use different schemes"
+    model = BlockStudent(pn, scales, dim=args.dim, depth=args.depth,
+                         n_cells=cells).to(device)
     print(f"student {sum(p.numel() for p in model.parameters())/1e6:.1f}M, "
-          f"L={model.L}, u={'gaussian' if args.gaussian else 'uniform'}, "
+          f"L={model.L}, aux={tr.get('aux', 'index')}"
+          f"{f' K={cells}' if cells else ''}, "
+          f"u={'gaussian' if args.gaussian else 'uniform'}, "
           f"loss={args.loss}", flush=True)
-    w = (tr["right"] - tr["left"])
-    print(f"train intervals: median {float(w.median()):.5f}  "
-          f"mean {float(w.mean()):.5f}  frac<1e-3 {float((w < 1e-3).float().mean()):.3f}",
-          flush=True)
+    if cells:
+        ids = tr["left"]
+        print(f"cell ids: unique {int(ids.unique().numel())} of {cells + 1}, "
+              f"mask rate {float((ids == cells).float().mean()):.5f}", flush=True)
+    else:
+        w = (tr["right"] - tr["left"])
+        print(f"train intervals: median {float(w.median()):.5f}  mean "
+              f"{float(w.mean()):.5f}  frac<1e-3 {float((w < 1e-3).float().mean()):.3f}",
+              flush=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05,
                             betas=(0.9, 0.95))
@@ -201,7 +221,7 @@ def main():
             j = perm[i:i + args.batch_size]
             tok = tr["tokens"][j].long().to(device, non_blocking=True)
             u = draw_u(tr["left"][j].to(device), tr["right"][j].to(device),
-                       args.gaussian)
+                       args.gaussian, cells)
             lab = tr["labels"][j].to(device)
             ce, ms = model(u, lab, mask)
             loss = 0.0
@@ -214,7 +234,7 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); sched.step(); step += 1
-        m = evaluate(model, va, mask, device, args.gaussian)
+        m = evaluate(model, va, mask, device, args.gaussian, cells=cells)
         mark = ""
         if m["emberr_real"] < best:
             best = m["emberr_real"]

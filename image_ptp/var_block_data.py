@@ -48,6 +48,50 @@ def scale_ramp(patch_nums, cfg, upto, device):
     return torch.cat(out)
 
 
+def embedding_order(codebook):
+    """A permutation of the codebook putting similar vectors next to each other.
+
+    Intervals are cut in code-index order, which is arbitrary: a u that lands one
+    interval off returns a vector unrelated to the right one. Under an ordering
+    by similarity a near miss is a near miss, which is the difference between a
+    regression head degrading gracefully and it returning noise. The tour is
+    greedy nearest-neighbour, as elsewhere in this project.
+    """
+    x = torch.nn.functional.normalize(codebook.float(), dim=-1)
+    n = x.shape[0]
+    left = torch.ones(n, dtype=torch.bool)
+    order = [0]
+    left[0] = False
+    cur = x[0]
+    for _ in range(n - 1):
+        d = (x @ cur)
+        d[~left] = -2.0
+        nxt = int(d.argmax())
+        order.append(nxt)
+        left[nxt] = False
+        cur = x[nxt]
+    return torch.tensor(order)
+
+
+def voronoi_ids(probs, S, K, truth, gen, max_active=256):
+    """A cell id per position instead of a scalar u.
+
+    Cells are handed to codes in proportion to their probability and by
+    proximity on the sphere, so neighbouring ids select geometrically related
+    codes -- the property the index ordering does not have. Reuses this
+    project's own quota and assignment code rather than a second implementation.
+    """
+    from image_ptp.prepare_voronoi_tokens import assign_cells
+    owner = assign_cells(probs, S, K, max_active)              # (P, K)
+    mine = owner == truth[:, None]
+    count = mine.sum(1)
+    r = torch.rand(truth.shape[0], generator=gen, device=probs.device)
+    pick = (r * count.clamp_min(1)).long()
+    csum = mine.long().cumsum(1)
+    chosen = ((csum == (pick + 1)[:, None]) & mine).float().argmax(1)
+    return torch.where(count > 0, chosen, torch.full_like(chosen, K)), int((count == 0).sum())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vae", default="/home/mengy13/VAR/checkpoints/vae_ch160v4096z32.pth")
@@ -58,6 +102,11 @@ def main():
     ap.add_argument("--cfg", type=float, default=1.5)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--aux", default="index",
+                    choices=["index", "embed", "voronoi"],
+                    help="index: intervals in code order; embed: intervals in "
+                         "similarity order; voronoi: a discrete cell id")
+    ap.add_argument("--K", type=int, default=4096, help="voronoi cells")
     args = ap.parse_args()
     device = "cuda"
     torch.set_grad_enabled(False)
@@ -83,6 +132,22 @@ def main():
     loader = DataLoader(Subset(ds, idx), batch_size=args.batch, num_workers=8)
 
     ramp = scale_ramp(pn, args.cfg, K, device).view(1, -1, 1)
+    codebook = vae.quantize.embedding.weight.data.float()
+    perm = inv = S = None
+    gen = torch.Generator(device=device).manual_seed(1)
+    masked = 0
+    if args.aux == "embed":
+        perm = embedding_order(codebook).to(device)          # new order -> code id
+        inv = torch.argsort(perm)                            # code id -> new rank
+        print(f"embedding order: mean cosine between neighbours "
+              f"{float(torch.nn.functional.cosine_similarity(codebook[perm[:-1]], codebook[perm[1:]]).mean()):.4f}"
+              f"  (random pairs {float(torch.nn.functional.cosine_similarity(codebook[torch.randperm(4096)[:4095]], codebook[torch.randperm(4096)[:4095]]).mean()):.4f})",
+              flush=True)
+    if args.aux == "voronoi":
+        g2 = torch.Generator(device=device).manual_seed(0)
+        sphere = torch.nn.functional.normalize(
+            torch.randn(args.K, codebook.shape[1], generator=g2, device=device), dim=-1)
+        S = (torch.nn.functional.normalize(codebook, dim=-1) @ sphere.T).contiguous()
     toks, lefts, rights, labels = [], [], [], []
     seen = 0
     for x, y in loader:
@@ -92,9 +157,18 @@ def main():
         xin = vae.quantize.idxBl_to_var_input(gt)
         lc, lu = guided_logits(var, y, xin, args.cfg, K)
         probs = torch.softmax((1 + ramp) * lc - ramp * lu, dim=-1)
-        cdf = probs.cumsum(-1)
-        right = cdf.gather(2, truth.unsqueeze(-1)).squeeze(-1)
-        left = right - probs.gather(2, truth.unsqueeze(-1)).squeeze(-1)
+        if args.aux == "voronoi":
+            flat_p = probs.reshape(-1, probs.shape[-1])
+            ids, m = voronoi_ids(flat_p, S, args.K, truth.reshape(-1), gen)
+            masked += m
+            left = ids.view(truth.shape).float()          # the id rides in u
+            right = left.clone()
+        else:
+            p = probs if perm is None else probs[..., perm]
+            tgt = truth if perm is None else inv[truth]
+            cdf = p.cumsum(-1)
+            right = cdf.gather(2, tgt.unsqueeze(-1)).squeeze(-1)
+            left = right - p.gather(2, tgt.unsqueeze(-1)).squeeze(-1)
         toks.append(truth.to(torch.int16).cpu())
         lefts.append(left.cpu()); rights.append(right.cpu()); labels.append(y.cpu())
         seen += x.shape[0]
@@ -102,12 +176,22 @@ def main():
             print(f"  {seen}/{args.images}", flush=True)
     payload = dict(tokens=torch.cat(toks), left=torch.cat(lefts),
                    right=torch.cat(rights), labels=torch.cat(labels),
-                   patch_nums=pn, scales=args.scales, cfg=args.cfg, K=K)
+                   patch_nums=pn, scales=args.scales, cfg=args.cfg, K=K,
+                   aux=args.aux, n_cells=args.K if args.aux == "voronoi" else 0)
+    if perm is not None:
+        payload["perm"] = perm.cpu()
+    if args.aux == "voronoi":
+        payload["sphere"] = sphere.cpu()
+        print(f"mask rate {masked / (payload['tokens'].numel()):.5f}")
 
     # A u drawn inside its interval must invert to the token it came from, or
     # the student is being trained against edges that describe nothing.
-    t = payload["tokens"][:256].long().to(device)
     l, r = payload["left"][:256].to(device), payload["right"][:256].to(device)
+    if args.aux == "voronoi":
+        print(f"\ncell ids: min {int(l.min())} max {int(l.max())} "
+              f"unique {int(l.unique().numel())}")
+        torch.save(payload, args.out)
+        print(f"wrote {args.out}"); print("BLOCK_DATA_DONE"); return
     print(f"\ninterval width: median {float((r - l).median()):.5f}  "
           f"min {float((r - l).min()):.2e}  frac<1e-4 {float(((r - l) < 1e-4).float().mean()):.3f}")
     print(f"intervals inside [0,1]: {bool((l >= -1e-6).all() and (r <= 1 + 1e-6).all())}")
