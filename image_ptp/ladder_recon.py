@@ -48,38 +48,38 @@ def main():
     g = torch.Generator().manual_seed(0)
     idx = torch.randperm(len(ds), generator=g)[:args.images].tolist()
     from torch.utils.data import DataLoader, Subset
-    loader = DataLoader(Subset(ds, idx), batch_size=32, num_workers=8)
+    loader = DataLoader(Subset(ds, idx), batch_size=16, num_workers=8)
 
     ext = InceptionFeatures(device=device)
-    reals, f_real = [], []
-    for x, _ in loader:
-        reals.append(x)
-        f_real.append(ext(x.to(device)).cpu())
-    reals = torch.cat(reals)
-    f_real = torch.cat(f_real)
-    print(f"{reals.shape[0]} ImageNet val images at 256x256, "
-          f"inception {f_real.shape[1]}-d\n")
-    print(f"{'ladder':<28} {'tokens':>7} {'PSNR dB':>8} {'recon FID':>10}")
 
+    # 50k images at 256x256 is 39 GB held as float32, so nothing is kept: each
+    # pass streams the loader and accumulates features only.
+    def sweep(pn=None):
+        feats, se, n = [], 0.0, 0
+        for x, _ in loader:
+            x = x.to(device)
+            if pn is None:
+                out = x
+            else:
+                f = vae.quant_conv(vae.encoder(x))
+                fhat = vae.quantize.f_to_idxBl_or_fhat(f, to_fhat=True,
+                                                       v_patch_nums=pn)[-1]
+                out = vae.fhat_to_img(fhat)
+                se += float(F.mse_loss(out, x, reduction="sum"))
+                n += x.numel()
+            feats.append(ext(out).cpu())
+        psnr = (10 * torch.log10(torch.tensor(4.0 / (se / n)))).item() if n else float("nan")
+        return torch.cat(feats), psnr
+
+    f_real, _ = sweep(None)
+    print(f"{f_real.shape[0]} ImageNet val images at 256x256, "
+          f"inception {f_real.shape[1]}-d\n")
+    print(f"{'ladder':<28} {'levels':>7} {'tokens':>7} {'PSNR dB':>8} {'recon FID':>10}")
     for spec in args.ladders.split("|"):
         pn = tuple(int(v) for v in spec.split(","))
-        feats, se, n = [], 0.0, 0
-        for i in range(0, reals.shape[0], 32):
-            x = reals[i:i + 32].to(device)
-            # idxBl_to_img walks self.v_patch_nums, the ladder the quantiser was
-            # constructed with, so it cannot decode a shorter one. Going through
-            # f_to_idxBl_or_fhat with to_fhat=True keeps the ladder that was asked
-            # for and returns the accumulated f_hat directly.
-            f = vae.quant_conv(vae.encoder(x))
-            fhat = vae.quantize.f_to_idxBl_or_fhat(f, to_fhat=True,
-                                                   v_patch_nums=pn)[-1]
-            rec = vae.fhat_to_img(fhat)
-            se += float(F.mse_loss(rec, x, reduction="sum"))
-            n += x.numel()
-            feats.append(ext(rec).cpu())
-        psnr = 10 * torch.log10(torch.tensor(4.0 / (se / n)))
-        print(f"{spec:<28} {sum(p * p for p in pn):>7} {float(psnr):8.2f} "
-              f"{frechet(torch.cat(feats), f_real):10.3f}")
+        f_rec, psnr = sweep(pn)
+        print(f"{spec:<28} {len(pn):>7} {sum(p * p for p in pn):>7} {psnr:8.2f} "
+              f"{frechet(f_rec, f_real):10.3f}", flush=True)
     print("LADDER_RECON_DONE")
 
 
