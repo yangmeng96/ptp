@@ -21,8 +21,63 @@ sys.path.insert(0, "/home/mengy13/VAR")
 
 
 @torch.no_grad()
+def expected_prefix(var, merge_k, cfg=1.5, chunk=250):
+    """Per class, the f_hat a merged block's scales would see if they knew only
+    the class -- not what the earlier scales in their own block sampled.
+
+    Feeding word_embed(0) instead is not a neutral input: it is that layer's
+    bias, a vector the model never saw at those positions, so a merged arm built
+    on it confounds "lost the in-block dependence" with "given something out of
+    distribution". The expectation of the embedding under the model's own
+    distribution is in distribution by construction -- it is a convex
+    combination of codebook vectors -- and carries only what the class already
+    implies. VAR's own more_smooth path does the same averaging.
+
+    Computed once for every class and cached, so inference costs no extra pass.
+    """
+    pn = var.patch_nums
+    SN = len(pn)
+    dev = var.lvl_1L.device
+    lvl_pos = var.lvl_embed(var.lvl_1L) + var.pos_1LC
+    out = [[] for _ in range(merge_k - 1)]
+    for lo in range(0, var.num_classes, chunk):
+        lab = torch.arange(lo, min(lo + chunk, var.num_classes), device=dev)
+        B = lab.shape[0]
+        sos = cond_BD = var.class_emb(torch.cat(
+            (lab, torch.full_like(lab, var.num_classes)), dim=0))
+        f_hat = sos.new_zeros(B, var.Cvae, pn[-1], pn[-1])
+        ntm = (sos.unsqueeze(1).expand(2 * B, var.first_l, -1)
+               + var.pos_start.expand(2 * B, var.first_l, -1)
+               + lvl_pos[:, :var.first_l])
+        for b in var.blocks:
+            b.attn.kv_caching(True)
+        cur_L = 0
+        for si in range(merge_k - 1):
+            cur_L += pn[si] ** 2
+            x = ntm
+            cond_gss = var.shared_ada_lin(cond_BD)
+            for b in var.blocks:
+                x = b(x=x, cond_BD=cond_gss, attn_bias=None)
+            logits = var.get_logits(x, cond_BD)
+            t = cfg * si / var.num_stages_minus_1
+            logits = (1 + t) * logits[:B] - t * logits[B:]
+            # expectation over the codebook instead of a draw from it
+            h = logits.softmax(-1) @ var.vae_quant_proxy[0].embedding.weight
+            h = h.transpose_(1, 2).reshape(B, var.Cvae, pn[si], pn[si])
+            f_hat, ntm = var.vae_quant_proxy[0].get_next_autoregressive_input(
+                si, SN, f_hat, h)
+            out[si].append(ntm.clone().cpu())
+            nxt = pn[si + 1] ** 2
+            ntm = ntm.view(B, var.Cvae, -1).transpose(1, 2)
+            ntm = (var.word_embed(ntm) + lvl_pos[:, cur_L:cur_L + nxt]).repeat(2, 1, 1)
+        for b in var.blocks:
+            b.attn.kv_caching(False)
+    return [torch.cat(v) for v in out]      # per scale: (num_classes, C, pn, pn)
+
+
+@torch.no_grad()
 def sample_merged(var, B, label_B, merge_k, cfg=1.5, top_k=900, top_p=0.96,
-                  g_seed=None):
+                  g_seed=None, prefix=None):
     """VAR's own loop, with scales [0, merge_k) emitted in one pass.
 
     merge_k=1 is the unmodified sampler. The merged positions are fed the input
@@ -45,10 +100,18 @@ def sample_merged(var, B, label_B, merge_k, cfg=1.5, top_k=900, top_p=0.96,
     # Positions past the first scale would normally carry word_embed of the
     # accumulated f_hat; inside the merged block that f_hat does not exist yet,
     # so they get what a zero f_hat gives, plus their own level and position.
-    zeros = var.word_embed(sos.new_zeros(2 * B, merged_L - var.first_l, var.Cvae))
     first = (sos.unsqueeze(1).expand(2 * B, var.first_l, -1)
              + var.pos_start.expand(2 * B, var.first_l, -1))
-    next_token_map = torch.cat([first, zeros], dim=1) + lvl_pos[:, :merged_L]
+    if prefix is None:
+        rest = var.word_embed(sos.new_zeros(2 * B, merged_L - var.first_l, var.Cvae))
+    else:
+        # Each merged scale gets the f_hat its class implies, marginal over what
+        # the earlier scales of its own block would have sampled.
+        rest = torch.cat([
+            var.word_embed(prefix[j][label_B].to(sos.device)
+                           .view(B, var.Cvae, -1).transpose(1, 2)).repeat(2, 1, 1)
+            for j in range(merge_k - 1)], dim=1)
+    next_token_map = torch.cat([first, rest], dim=1) + lvl_pos[:, :merged_L]
 
     for b in var.blocks:
         b.attn.kv_caching(True)
@@ -96,6 +159,8 @@ def main():
     ap.add_argument("--images", type=int, default=20000)
     ap.add_argument("--merge", default="1,2,3,4,5,7")
     ap.add_argument("--batch", type=int, default=25)
+    ap.add_argument("--prefix", default="expected",
+                    choices=["expected", "zero"])
     args = ap.parse_args()
     device = "cuda"
     torch.set_grad_enabled(False)
@@ -126,13 +191,15 @@ def main():
     print(f"{'merged':>8} {'forwards':>9} {'FID':>9}")
 
     ms = [11.68, 11.17, 11.19, 11.30, 11.39, 11.53, 16.43, 24.28, 34.84, 42.08]
+    use_exp = args.prefix == "expected"
     for k in (int(v) for v in args.merge.split(",")):
+        prefix = expected_prefix(var, k) if (use_exp and k > 1) else None
         feats = []
         for i in range(0, args.images, args.batch):
             b = min(args.batch, args.images - i)
             lab = torch.randint(0, 1000, (b,), device=device,
                                 generator=torch.Generator(device=device).manual_seed(i))
-            img = sample_merged(var, b, lab, k, g_seed=i)
+            img = sample_merged(var, b, lab, k, g_seed=i, prefix=prefix)
             feats.append(ext(img * 2 - 1).cpu())          # [0,1] -> [-1,1]
         lat = ms[0] + sum(ms[k:])
         print(f"{f'first {k}':>8} {len(pn) - k + 1:>9} "
