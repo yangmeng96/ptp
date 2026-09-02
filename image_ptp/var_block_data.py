@@ -73,7 +73,7 @@ def embedding_order(codebook):
     return torch.tensor(order)
 
 
-def voronoi_ids(probs, S, K, truth, gen, max_active=256):
+def voronoi_ids(probs, S, K, truth, gen, max_active=2048):
     """A cell id per position instead of a scalar u.
 
     Cells are handed to codes in proportion to their probability and by
@@ -106,7 +106,13 @@ def main():
                     choices=["index", "embed", "voronoi"],
                     help="index: intervals in code order; embed: intervals in "
                          "similarity order; voronoi: a discrete cell id")
-    ap.add_argument("--K", type=int, default=4096, help="voronoi cells")
+    # A code needs K*p >= 0.5 to be given any cell at all, and 11% of positions
+    # here sit below p = 1e-4, so 4096 cells left 42.7% of true tokens with none.
+    # max_active bounds the shortlist the solver considers, and at 6.8 nats a
+    # token the effective candidate count is around 900 -- a shortlist of 256
+    # dropped the true token outright a large part of the time.
+    ap.add_argument("--K", type=int, default=16384, help="voronoi cells")
+    ap.add_argument("--max-active", type=int, default=2048)
     args = ap.parse_args()
     device = "cuda"
     torch.set_grad_enabled(False)
@@ -159,7 +165,8 @@ def main():
         probs = torch.softmax((1 + ramp) * lc - ramp * lu, dim=-1)
         if args.aux == "voronoi":
             flat_p = probs.reshape(-1, probs.shape[-1])
-            ids, m = voronoi_ids(flat_p, S, args.K, truth.reshape(-1), gen)
+            ids, m = voronoi_ids(flat_p, S, args.K, truth.reshape(-1), gen,
+                                 max_active=args.max_active)
             masked += m
             left = ids.view(truth.shape).float()          # the id rides in u
             right = left.clone()
@@ -182,7 +189,11 @@ def main():
         payload["perm"] = perm.cpu()
     if args.aux == "voronoi":
         payload["sphere"] = sphere.cpu()
-        print(f"mask rate {masked / (payload['tokens'].numel()):.5f}")
+        rate = masked / payload["tokens"].numel()
+        print(f"mask rate {rate:.5f}")
+        assert rate < 0.05, (
+            f"{rate:.1%} of true tokens were given no cell; raise --K (a code "
+            f"needs K*p >= 0.5) or --max-active (the solver's shortlist)")
 
     # A u drawn inside its interval must invert to the token it came from, or
     # the student is being trained against edges that describe nothing.
