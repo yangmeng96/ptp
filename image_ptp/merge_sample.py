@@ -108,7 +108,7 @@ def sample_merged(var, B, label_B, merge_k, cfg=1.5, top_k=900, top_p=0.96,
         # Each merged scale gets the f_hat its class implies, marginal over what
         # the earlier scales of its own block would have sampled.
         rest = torch.cat([
-            var.word_embed(prefix[j][label_B].to(sos.device)
+            var.word_embed(prefix[j][label_B]
                            .view(B, var.Cvae, -1).transpose(1, 2)).repeat(2, 1, 1)
             for j in range(merge_k - 1)], dim=1)
     next_token_map = torch.cat([first, rest], dim=1) + lvl_pos[:, :merged_L]
@@ -193,7 +193,8 @@ def main():
     ms = [11.68, 11.17, 11.19, 11.30, 11.39, 11.53, 16.43, 24.28, 34.84, 42.08]
     use_exp = args.prefix == "expected"
     for k in (int(v) for v in args.merge.split(",")):
-        prefix = expected_prefix(var, k) if (use_exp and k > 1) else None
+        prefix = ([t.to(device) for t in expected_prefix(var, k)]
+                  if (use_exp and k > 1) else None)
         feats = []
         for i in range(0, args.images, args.batch):
             b = min(args.batch, args.images - i)
