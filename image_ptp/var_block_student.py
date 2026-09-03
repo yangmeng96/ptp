@@ -281,6 +281,20 @@ def main():
     tr["codebook"] = va["codebook"] = codebook
     mask = scale_causal_mask(pn, scales, device, args.mode)
 
+    # An embedding ordering cuts the intervals in rank space, so u lives there.
+    # A C-PTP head inverts its own CDF at that u, and a head trained against code
+    # ids would be inverting in a different coordinate system than the one u came
+    # from -- which is why that arm read its auxiliaries at a lift of 1.45 while
+    # the unpermuted one reached 15. Targets move into rank space here, and the
+    # sampler maps the answer back through perm.
+    perm = tr.get("perm")
+    if perm is not None:
+        inv = torch.argsort(perm)
+        for d in (tr, va):
+            d["tokens"] = inv[d["tokens"].long()].to(torch.int16)
+        codebook = codebook[perm]
+        print(f"targets moved into embedding-order rank space", flush=True)
+
     cells = int(tr.get("n_cells", 0))
     assert cells == int(va.get("n_cells", 0)), "train and val use different schemes"
     sphere = tr.get("sphere")
