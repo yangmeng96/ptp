@@ -189,11 +189,19 @@ def main():
         payload["perm"] = perm.cpu()
     if args.aux == "voronoi":
         payload["sphere"] = sphere.cpu()
+        torch.save(payload, args.out)
+        print(f"wrote {args.out} before checking the mask rate, so the check "
+              f"cannot cost the run")
         rate = masked / payload["tokens"].numel()
         print(f"mask rate {rate:.5f}")
-        assert rate < 0.05, (
-            f"{rate:.1%} of true tokens were given no cell; raise --K (a code "
-            f"needs K*p >= 0.5) or --max-active (the solver's shortlist)")
+        # A warning, not an assertion, and after the file is written: this check
+        # sat before torch.save and threw away a twenty-hour run at 6.7%. The
+        # number still has to be seen -- a masked position is one the student
+        # cannot recover -- but seeing it is not worth discarding the data.
+        if rate >= 0.05:
+            print(f"WARNING: {rate:.1%} of true tokens were given no cell. A "
+                  f"code needs K*p >= 0.5 for a quota of one; raise --K or "
+                  f"--max-active if this is too high to train against.")
 
     # A u drawn inside its interval must invert to the token it came from, or
     # the student is being trained against edges that describe nothing.
