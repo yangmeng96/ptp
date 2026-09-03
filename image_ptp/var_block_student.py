@@ -297,7 +297,14 @@ def main():
     cells = int(tr.get("n_cells", 0))
     assert cells == int(va.get("n_cells", 0)), "train and val use different schemes"
     sphere = tr.get("sphere")
-    model = BlockStudent(pn, scales, dim=args.dim, depth=args.depth,
+    # Sized from the codebook that was actually loaded. Leaving this at its
+    # 4096 default put a 4096-way head on MNIST's 512-code tokeniser: O-PTP
+    # survived because argmax never left the range it had seen, and C-PTP did
+    # not, because inverting a CDF over 4096 entries returns indices no 512-row
+    # codebook can be indexed with.
+    model = BlockStudent(pn, scales, vocab=codebook.shape[0],
+                         n_class=int(tr["labels"].max()) + 1,
+                         dim=args.dim, depth=args.depth,
                          n_cells=cells, u_encoding=args.u_encoding,
                          drop=args.drop, mode=args.mode,
                          sphere=None if sphere is None else sphere.float()).to(device)
