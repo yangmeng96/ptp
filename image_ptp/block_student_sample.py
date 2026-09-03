@@ -64,6 +64,22 @@ def sample_with_student(var, student, mask, B, label_B, merge_k, cells=0,
         idx = torch.cdist(ms.reshape(-1, ms.shape[-1]),
                           emb.weight).argmin(-1).view(B, merged_L)
 
+    return continue_from_block(var, idx, label_B, merge_k, cfg, top_k, top_p, rng)
+
+
+@torch.no_grad()
+def continue_from_block(var, idx, label_B, merge_k, cfg=1.5, top_k=900,
+                        top_p=0.96, rng=None):
+    """Given the first merge_k scales' tokens, however they were chosen, run the
+    frozen scales after them. Fills VAR's own KV cache for those positions from
+    word_embed(f_hat) under VAR's own mask -- verified against teacher forcing to
+    2.9e-5 -- so the later scales read exactly what they were trained on."""
+    pn, SN = var.patch_nums, len(var.patch_nums)
+    dev = var.lvl_1L.device
+    B = idx.shape[0]
+    merged_L = sum(p * p for p in pn[:merge_k])
+    emb = var.vae_quant_proxy[0].embedding
+
     # ---- 2. f_hat from those tokens, and the inputs the frozen scales expect
     f_hat = torch.zeros(B, var.Cvae, pn[-1], pn[-1], device=dev)
     maps, off = [], 0
@@ -119,6 +135,30 @@ def sample_with_student(var, student, mask, B, label_B, merge_k, cells=0,
     for b in var.blocks:
         b.attn.kv_caching(False)
     return var.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
+
+
+@torch.no_grad()
+def sample_with_ar(var, ar, B, label_B, merge_k, cfg=1.5, top_k=900,
+                   top_p=0.96, g_seed=None):
+    """30 sequential steps over the block, each seeing the tokens sampled before
+    it, then the same continuation the student uses. This is the PTP ceiling:
+    the same block, the same data, no single-forward constraint and no u."""
+    rng = None
+    if g_seed is not None:
+        var.rng.manual_seed(g_seed)
+        rng = var.rng
+    dev = var.lvl_1L.device
+    L, bos = ar.L, ar.vocab
+    fed = torch.full((B, L), bos, dtype=torch.long, device=dev)
+    idx = torch.zeros(B, L, dtype=torch.long, device=dev)
+    g = torch.Generator(device=dev).manual_seed(0 if g_seed is None else g_seed)
+    for i in range(L):
+        logits = ar(fed, label_B)[:, i].float()
+        p = torch.softmax(logits, -1)
+        idx[:, i] = torch.multinomial(p, 1, generator=g).squeeze(1)
+        if i + 1 < L:
+            fed[:, i + 1] = idx[:, i]
+    return continue_from_block(var, idx, label_B, merge_k, cfg, top_k, top_p, rng)
 
 
 def main():
@@ -190,6 +230,17 @@ def main():
         a = blob["args"]
         sd = blob["model"]
         scales, cells = 4, 0
+        if "vocab" in blob and "head.weight" in sd:          # a BlockAR
+            from image_ptp.block_ar import BlockAR
+            ar = BlockAR(pn, blob["scales"], vocab=blob["vocab"],
+                         n_class=sd["cls.weight"].shape[0] - 1,
+                         dim=a["dim"], depth=a["depth"])
+            ar.load_state_dict(sd)
+            ar = ar.to(device).eval()
+            score(f"merge {scales} + {name} [AR, {ar.L} steps]",
+                  lambda b, lab, i: sample_with_ar(var, ar, b, lab, scales,
+                                                   g_seed=i))
+            continue
         mode = a.get("mode", "optp")
         st = BlockStudent(pn, scales, vocab=sd["head_ce.weight"].shape[0],
                           n_class=sd["cls.weight"].shape[0] - 1,
