@@ -31,14 +31,34 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
-def scale_causal_mask(patch_nums, scales, device):
-    """(L, L) bool: position may attend to strictly earlier scales, plus itself."""
+def scale_causal_mask(patch_nums, scales, device, mode="optp"):
+    """Who may attend to whom inside the merged block.
+
+    O-PTP (L, L): a position reads strictly earlier scales and itself, so its own
+    u is available and its output collapses to the one-hot that u selects.
+
+    C-PTP (2L, 2L): a position must not see its own u, and simply dropping the
+    diagonal does not achieve that -- the residual stream carries its own input
+    past the attention regardless, and the first scale would attend to nothing
+    and produce NaN. So the block is two streams: the first L positions carry
+    the auxiliaries for others to read, the last L carry only level, position
+    and class and emit the predictions. A query reads the auxiliary stream of
+    strictly earlier scales, never its own, and always itself so no row is
+    empty. The optimum of the same cross-entropy is then the teacher's
+    distribution rather than a one-hot.
+    """
     lvl = torch.cat([torch.full((p * p,), si, device=device)
                      for si, p in enumerate(patch_nums[:scales])])
     L = lvl.shape[0]
-    allow = lvl[None, :] < lvl[:, None]
-    allow |= torch.eye(L, dtype=torch.bool, device=device)
-    return allow
+    earlier = lvl[None, :] < lvl[:, None]
+    eye = torch.eye(L, dtype=torch.bool, device=device)
+    if mode == "optp":
+        return earlier | eye
+    m = torch.zeros(2 * L, 2 * L, dtype=torch.bool, device=device)
+    m[:L, :L] = earlier | eye          # the u stream builds its own context
+    m[L:, :L] = earlier                # queries read earlier scales' u only
+    m[L:, L:] = eye                    # and themselves, so no row is all -inf
+    return m
 
 
 class FourierU(nn.Module):
@@ -136,9 +156,9 @@ class Block(nn.Module):
 class BlockStudent(nn.Module):
     def __init__(self, patch_nums, scales, vocab=4096, cvae=32, n_class=1000,
                  dim=512, depth=8, heads=8, n_cells=0, sphere=None,
-                 u_encoding="binary", drop=0.0):
+                 u_encoding="binary", drop=0.0, mode="optp"):
         super().__init__()
-        self.patch_nums, self.scales = patch_nums, scales
+        self.patch_nums, self.scales, self.mode = patch_nums, scales, mode
         L = sum(p * p for p in patch_nums[:scales])
         self.L = L
         # A Voronoi auxiliary is already discrete -- an id into cells that were
@@ -166,12 +186,16 @@ class BlockStudent(nn.Module):
 
     def forward(self, u, label, mask):
         B = u.shape[0]
-        x = (self.u_embed(u) + self.lvl(self.lvl_id)[None]
-             + self.pos(torch.arange(self.L, device=u.device))[None]
-             + self.cls(label)[:, None])
+        pos = self.pos(torch.arange(self.L, device=u.device))[None]
+        site = self.lvl(self.lvl_id)[None] + pos + self.cls(label)[:, None]
+        if self.mode == "optp":
+            x = self.u_embed(u) + site
+        else:
+            # the u stream, then a query stream that carries no auxiliary at all
+            x = torch.cat([self.u_embed(u) + site, site.expand(B, -1, -1)], dim=1)
         for b in self.blocks:
             x = b(x, mask)
-        x = self.norm(x)
+        x = self.norm(x[:, self.L:] if self.mode == "cptp" else x)
         return self.head_ce(x), self.head_mse(x)
 
 
@@ -190,7 +214,8 @@ def draw_u(left, right, gaussian, cells=0):
     return u
 
 
-def evaluate(model, data, mask, device, gaussian, n=4096, cells=0):
+def evaluate(model, data, mask, device, gaussian, n=4096, cells=0,
+             mode="optp"):
     """Exact-code agreement, and how far the emitted embedding lands.
 
     `agree` is PTP's own criterion and demands the identical code. `embed err`
@@ -214,7 +239,17 @@ def evaluate(model, data, mask, device, gaussian, n=4096, cells=0):
             if shuffle:
                 u = u[torch.randperm(u.shape[0], device=device)]
             ce, ms = model(u, lab, mask)
-            pred = ce.argmax(-1)
+            if mode == "cptp":
+                # the head is meant to be the teacher's distribution, so the token
+                # comes from inverting its CDF at this slot's own u -- taking the
+                # argmax would be reading it as a one-hot it was never trained to be
+                q = ce.softmax(-1).cumsum(-1)
+                uu = u if not gaussian else 0.5 * (1 + torch.erf(u / math.sqrt(2)))
+                pred = torch.searchsorted(q.contiguous(),
+                                          uu.unsqueeze(-1).contiguous()
+                                          ).squeeze(-1).clamp(max=ce.shape[-1] - 1)
+            else:
+                pred = ce.argmax(-1)
             out[f"agree_{name}"] = float((pred == tok).float().mean())
             true_emb = emb[tok]
             out[f"emberr_{name}"] = float(
@@ -246,6 +281,7 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--u-encoding", default="binary",
                     choices=["binary", "fourier"])
+    ap.add_argument("--mode", default="optp", choices=["optp", "cptp"])
     args = ap.parse_args()
     device = args.device
 
@@ -256,18 +292,19 @@ def main():
     sd = torch.load(args.vae, map_location="cpu")
     codebook = sd["quantize.embedding.weight"].float()
     tr["codebook"] = va["codebook"] = codebook
-    mask = scale_causal_mask(pn, scales, device)
+    mask = scale_causal_mask(pn, scales, device, args.mode)
 
     cells = int(tr.get("n_cells", 0))
     assert cells == int(va.get("n_cells", 0)), "train and val use different schemes"
     sphere = tr.get("sphere")
     model = BlockStudent(pn, scales, dim=args.dim, depth=args.depth,
                          n_cells=cells, u_encoding=args.u_encoding,
-                         drop=args.drop,
+                         drop=args.drop, mode=args.mode,
                          sphere=None if sphere is None else sphere.float()).to(device)
     print(f"student {sum(p.numel() for p in model.parameters())/1e6:.1f}M, "
           f"L={model.L}, aux={tr.get('aux', 'index')}"
           f"{f' K={cells}' if cells else ''}, "
+          f"{args.mode}, "
           f"u={'gaussian' if args.gaussian else 'uniform'}/{args.u_encoding}, "
           f"loss={args.loss}", flush=True)
     if cells:
@@ -307,7 +344,8 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); sched.step(); step += 1
-        m = evaluate(model, va, mask, device, args.gaussian, cells=cells)
+        m = evaluate(model, va, mask, device, args.gaussian, cells=cells,
+                     mode=args.mode)
         mark = ""
         if m["agree_real"] > best:
             best = m["agree_real"]
