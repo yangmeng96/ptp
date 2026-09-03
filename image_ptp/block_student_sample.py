@@ -74,6 +74,7 @@ def continue_from_block(var, idx, label_B, merge_k, cfg=1.5, top_k=900,
     frozen scales after them. Fills VAR's own KV cache for those positions from
     word_embed(f_hat) under VAR's own mask -- verified against teacher forcing to
     2.9e-5 -- so the later scales read exactly what they were trained on."""
+    from models.helpers import sample_with_top_k_top_p_
     pn, SN = var.patch_nums, len(var.patch_nums)
     dev = var.lvl_1L.device
     B = idx.shape[0]
