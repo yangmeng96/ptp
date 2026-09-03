@@ -32,20 +32,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def scale_causal_mask(patch_nums, scales, device, mode="optp"):
-    """Who may attend to whom inside the merged block.
+    """Who may attend to whom inside the merged block. Always (L, L).
 
-    O-PTP (L, L): a position reads strictly earlier scales and itself, so its own
-    u is available and its output collapses to the one-hot that u selects.
+    O-PTP: a position reads strictly earlier scales and itself, so its own u is
+    available and its output collapses to the one-hot that u selects.
 
-    C-PTP (2L, 2L): a position must not see its own u, and simply dropping the
-    diagonal does not achieve that -- the residual stream carries its own input
-    past the attention regardless, and the first scale would attend to nothing
-    and produce NaN. So the block is two streams: the first L positions carry
-    the auxiliaries for others to read, the last L carry only level, position
-    and class and emit the predictions. A query reads the auxiliary stream of
-    strictly earlier scales, never its own, and always itself so no row is
-    empty. The optimum of the same cross-entropy is then the teacher's
-    distribution rather than a one-hot.
+    C-PTP: the auxiliaries are shifted by one -- position p carries u_{p-1} -- so
+    a position never holds its own. Shifting alone loses one, though: position 15
+    is the second slot of the 4x4 scale, it reads positions 0..13 and gets
+    u_0..u_12, and u_13 is held by position 14, which is in its own scale and
+    therefore masked. Every slot but the first of each scale misses exactly the
+    last u of the scale before it, and no relabelling fixes it -- 4x4 has 16
+    slots and only 14 auxiliaries precede it.
+
+    Letting each slot also read the first slot of its own scale supplies exactly
+    that one. Position 14 carries u_13 and, reading only earlier scales itself,
+    carries nothing from 4x4, so it is safe to read and completes the set.
     """
     lvl = torch.cat([torch.full((p * p,), si, device=device)
                      for si, p in enumerate(patch_nums[:scales])])
@@ -54,33 +56,21 @@ def scale_causal_mask(patch_nums, scales, device, mode="optp"):
     eye = torch.eye(L, dtype=torch.bool, device=device)
     if mode == "optp":
         return earlier | eye
-    m = torch.zeros(2 * L, 2 * L, dtype=torch.bool, device=device)
-    m[:L, :L] = earlier | eye          # the u stream builds its own context
-    m[L:, :L] = earlier                # queries read earlier scales' u only
-    m[L:, L:] = eye                    # and themselves, so no row is all -inf
-    return m
+    firsts = torch.zeros(L, dtype=torch.bool, device=device)
+    off = 0
+    for p in patch_nums[:scales]:
+        firsts[off] = True
+        off += p * p
+    same_scale_first = (lvl[None, :] == lvl[:, None]) & firsts[None, :]
+    return earlier | eye | same_scale_first
 
 
-class FourierU(nn.Module):
-    """Encode a scalar u with a spread of frequencies, then project.
-
-    A sinusoid of frequency F separates u values about 1/F apart, so the ladder's
-    top frequency is a hard resolution limit on everything downstream. The first
-    run capped it at 512 -- a floor of 0.002 -- against intervals whose median is
-    0.00119 and 46.5% of which are narrower than 0.001. The encoder could not
-    distinguish the inputs at all, and the regression head correctly answered
-    with the codebook mean, which is what an error of 1.0 relative was.
-    """
-
-    def __init__(self, dim, n_freq=160, max_freq=16384.0):
-        super().__init__()
-        freqs = torch.exp(torch.linspace(0, math.log(max_freq), n_freq))
-        self.register_buffer("freqs", freqs)
-        self.proj = nn.Linear(2 * n_freq + 1, dim)
-
-    def forward(self, u):                       # (B, L) -> (B, L, dim)
-        a = u.unsqueeze(-1) * self.freqs
-        return self.proj(torch.cat([u.unsqueeze(-1), a.sin(), a.cos()], -1))
+def shift_auxiliaries(u, first_slot=0.5):
+    """Position p receives u_{p-1}; the first slot has no predecessor."""
+    out = torch.empty_like(u)
+    out[:, 0] = first_slot
+    out[:, 1:] = u[:, :-1]
+    return out
 
 
 class BinaryU(nn.Module):
@@ -188,14 +178,11 @@ class BlockStudent(nn.Module):
         B = u.shape[0]
         pos = self.pos(torch.arange(self.L, device=u.device))[None]
         site = self.lvl(self.lvl_id)[None] + pos + self.cls(label)[:, None]
-        if self.mode == "optp":
-            x = self.u_embed(u) + site
-        else:
-            # the u stream, then a query stream that carries no auxiliary at all
-            x = torch.cat([self.u_embed(u) + site, site.expand(B, -1, -1)], dim=1)
+        fed = u if self.mode == "optp" else shift_auxiliaries(u)
+        x = self.u_embed(fed) + site
         for b in self.blocks:
             x = b(x, mask)
-        x = self.norm(x[:, self.L:] if self.mode == "cptp" else x)
+        x = self.norm(x)
         return self.head_ce(x), self.head_mse(x)
 
 
