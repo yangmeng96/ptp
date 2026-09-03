@@ -112,30 +112,47 @@ def main():
     # token the effective candidate count is around 900 -- a shortlist of 256
     # dropped the true token outright a large part of the time.
     ap.add_argument("--K", type=int, default=16384, help="voronoi cells")
+    # MNIST runs the same pipeline against its own ladder and teacher, so the
+    # formulation can be checked somewhere cheap before ImageNet training time
+    # is spent on it.
+    ap.add_argument("--source", default="imagenet", choices=["imagenet", "mnist"])
+    ap.add_argument("--mnist-dir",
+                    default="/home/mengy13/ptp-image-results/mnist_var_r2")
+    ap.add_argument("--mnist-patch", default="1,2,4,8")
+    ap.add_argument("--split", default="train", choices=["train", "test"])
     ap.add_argument("--max-active", type=int, default=2048)
     args = ap.parse_args()
     device = "cuda"
     torch.set_grad_enabled(False)
 
-    from models import build_vae_var
-    pn = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
+    if args.source == "mnist":
+        from image_ptp.mnist_merge import load as load_mnist
+        mv, vae, var = load_mnist(args.mnist_dir, args.mnist_patch)
+        pn = var.patch_nums
+    else:
+        from models import build_vae_var
+        pn = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16)
+        vae, var = build_vae_var(device=device, patch_nums=pn, num_classes=1000,
+                                 depth=16, shared_aln=False)
+        vae.load_state_dict(torch.load(args.vae, map_location="cpu"), strict=True)
+        var.load_state_dict(torch.load(args.var, map_location="cpu"), strict=True)
+        vae.eval(); var.eval()
+        var.cond_drop_rate = 0.0
     K = sum(p * p for p in pn[:args.scales])
-    vae, var = build_vae_var(device=device, patch_nums=pn, num_classes=1000,
-                             depth=16, shared_aln=False)
-    vae.load_state_dict(torch.load(args.vae, map_location="cpu"), strict=True)
-    var.load_state_dict(torch.load(args.var, map_location="cpu"), strict=True)
-    vae.eval(); var.eval()
-    var.cond_drop_rate = 0.0
 
-    from torchvision import datasets, transforms
-    from torch.utils.data import DataLoader, Subset
-    tfm = transforms.Compose([transforms.Resize(292), transforms.CenterCrop(256),
-                              transforms.ToTensor(),
-                              transforms.Normalize((0.5,) * 3, (0.5,) * 3)])
-    ds = datasets.ImageFolder(args.data, transform=tfm)
-    g = torch.Generator().manual_seed(0)
-    idx = torch.randperm(len(ds), generator=g)[:args.images].tolist()
-    loader = DataLoader(Subset(ds, idx), batch_size=args.batch, num_workers=8)
+    if args.source == "mnist":
+        loader = mv.data_loader(args.split == "train", batch=args.batch, workers=4)
+    else:
+        from torchvision import datasets, transforms
+        from torch.utils.data import DataLoader, Subset
+        tfm = transforms.Compose([transforms.Resize(292),
+                                  transforms.CenterCrop(256),
+                                  transforms.ToTensor(),
+                                  transforms.Normalize((0.5,) * 3, (0.5,) * 3)])
+        ds = datasets.ImageFolder(args.data, transform=tfm)
+        g = torch.Generator().manual_seed(0)
+        idx = torch.randperm(len(ds), generator=g)[:args.images].tolist()
+        loader = DataLoader(Subset(ds, idx), batch_size=args.batch, num_workers=8)
 
     ramp = scale_ramp(pn, args.cfg, K, device).view(1, -1, 1)
     codebook = vae.quantize.embedding.weight.data.float()
@@ -179,6 +196,8 @@ def main():
         toks.append(truth.to(torch.int16).cpu())
         lefts.append(left.cpu()); rights.append(right.cpu()); labels.append(y.cpu())
         seen += x.shape[0]
+        if seen >= args.images:
+            break
         if seen % (args.batch * 200) == 0:
             print(f"  {seen}/{args.images}", flush=True)
     payload = dict(tokens=torch.cat(toks), left=torch.cat(lefts),
