@@ -67,8 +67,14 @@ def main():
                           dim=a["dim"], depth=a["depth"],
                           u_encoding=a.get("u_encoding", "binary"), mode=mode)
         st.load_state_dict(sd)
+        # An embedding-ordered student predicts ranks in that order, while the
+        # teacher's ranking below is over code ids; map its answer back first.
+        perm = None
+        if "embed" in str(a.get("train", "")):
+            perm = torch.load(a["train"], map_location="cpu").get("perm")
+            perm = None if perm is None else perm.to(device)
         students[name] = (st.to(device).eval(), a, mode,
-                          scale_causal_mask(pn, args.scales, device, mode))
+                          scale_causal_mask(pn, args.scales, device, mode), perm)
 
     ranks = {n: [] for n in students}
     ranks["teacher's own sample"] = []
@@ -95,7 +101,7 @@ def main():
         drawn = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1).view(B, K)
         ranks["teacher's own sample"].append(
             rank_of.gather(2, drawn.unsqueeze(-1)).squeeze(-1).cpu())
-        for n, (st, a, mode, mask) in students.items():
+        for n, (st, a, mode, mask, perm) in students.items():
             u = draw_u(left, right, a["gaussian"])
             out = st(u, y, mask)[0]
             if mode == "cptp":
@@ -107,6 +113,8 @@ def main():
                                           ).squeeze(-1).clamp(max=out.shape[-1] - 1)
             else:
                 pred = out.argmax(-1)
+            if perm is not None:
+                pred = perm[pred]
             ranks[n].append(rank_of.gather(2, pred.unsqueeze(-1)).squeeze(-1).cpu())
 
     ranks = {n: torch.cat(v).float() for n, v in ranks.items()}
