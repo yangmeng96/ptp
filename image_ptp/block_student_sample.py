@@ -131,6 +131,10 @@ def main():
     ap.add_argument("--images", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=25)
     ap.add_argument("--heads", default="ce,mse")
+    ap.add_argument("--grid", type=int, default=8,
+                    help="images per arm saved for visual comparison")
+    ap.add_argument("--grid-out",
+                    default="/home/mengy13/ptp-image-results/block_samples.png")
     args = ap.parse_args()
     device = "cuda"
     torch.set_grad_enabled(False)
@@ -161,13 +165,19 @@ def main():
     check_sample_count(f_real.shape[0], f_real.shape[1])
     print(f"{f_real.shape[0]} real ImageNet val images\n")
 
+    grids = {}
+
     def score(name, sampler):
         feats = []
         for i in range(0, args.images, args.batch):
             b = min(args.batch, args.images - i)
             lab = torch.randint(0, 1000, (b,), device=device,
                                 generator=torch.Generator(device=device).manual_seed(i))
-            feats.append(ext(sampler(b, lab, i) * 2 - 1).cpu())
+            img = sampler(b, lab, i)
+            # every arm draws the same labels for batch 0, so the grids line up
+            if i == 0:
+                grids[name] = img[:args.grid].cpu()
+            feats.append(ext(img * 2 - 1).cpu())
         print(f"{name:<34} {frechet(torch.cat(feats), f_real):9.3f}", flush=True)
 
     print(f"{'arm':<34} {'FID':>9}")
@@ -203,6 +213,14 @@ def main():
                   lambda b, lab, i, h=head: sample_with_student(
                       var, st, mask, b, lab, scales, gaussian=a["gaussian"],
                       head=h, g_seed=i, mode=mode, perm=perm))
+    if grids:
+        from torchvision.utils import save_image
+        names = list(grids)
+        rows = torch.cat([grids[n] for n in names])
+        save_image(rows, args.grid_out, nrow=args.grid, padding=2)
+        print(f"\nwrote {args.grid_out}: one row per arm, same labels across rows")
+        for k, n in enumerate(names):
+            print(f"  row {k + 1}: {n}")
     print("STUDENT_SAMPLE_DONE")
 
 
