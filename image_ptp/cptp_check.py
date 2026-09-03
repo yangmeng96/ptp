@@ -47,11 +47,17 @@ def main():
         name, ck = spec.split("=", 1)
         blob = torch.load(ck, map_location="cpu")
         a = blob["args"]
-        st = BlockStudent(pn, args.scales, vocab=mv.VOCAB, dim=a["dim"],
-                          depth=a["depth"], n_class=mv.NUM_CLASSES,
+        # Shapes come from the checkpoint, not from the dataset: students
+        # trained before the vocabulary was sized from the data carry a 4096-way
+        # head on MNIST's 512 codes, and rebuilding them at the right size would
+        # simply fail to load.
+        sd = blob["model"]
+        st = BlockStudent(pn, args.scales, vocab=sd["head_ce.weight"].shape[0],
+                          dim=a["dim"], depth=a["depth"],
+                          n_class=sd["cls.weight"].shape[0] - 1,
                           u_encoding=a.get("u_encoding", "binary"),
                           mode=a.get("mode", "optp"))
-        st.load_state_dict(blob["model"])
+        st.load_state_dict(sd)
         students[name] = (st.to(device).eval(), a,
                           scale_causal_mask(pn, args.scales, device,
                                             a.get("mode", "optp")))
@@ -74,7 +80,7 @@ def main():
         left = right - p.gather(2, truth.unsqueeze(-1)).squeeze(-1)
         for n, (st, a, mask) in students.items():
             u = draw_u(left, right, a["gaussian"])
-            q = st(u, y, mask)[0].softmax(-1)
+            q = st(u, y, mask)[0][..., :p.shape[-1]].softmax(-1)
             acc[n]["kl"] += float((p * ((p + 1e-9).log() - (q + 1e-9).log()))
                                   .sum(-1).mean()) * B
             acc[n]["tv"] += float(0.5 * (p - q).abs().sum(-1).mean()) * B
