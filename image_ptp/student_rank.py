@@ -60,11 +60,15 @@ def main():
         name, ck = spec.split("=", 1)
         blob = torch.load(ck, map_location="cpu")
         a = blob["args"]
-        st = BlockStudent(pn, args.scales, dim=a["dim"], depth=a["depth"],
-                          u_encoding=a.get("u_encoding", "binary"))
-        st.load_state_dict(blob["model"])
-        students[name] = (st.to(device).eval(), a)
-    mask = scale_causal_mask(pn, args.scales, device)
+        sd = blob["model"]
+        mode = a.get("mode", "optp")
+        st = BlockStudent(pn, args.scales, vocab=sd["head_ce.weight"].shape[0],
+                          n_class=sd["cls.weight"].shape[0] - 1,
+                          dim=a["dim"], depth=a["depth"],
+                          u_encoding=a.get("u_encoding", "binary"), mode=mode)
+        st.load_state_dict(sd)
+        students[name] = (st.to(device).eval(), a, mode,
+                          scale_causal_mask(pn, args.scales, device, mode))
 
     ranks = {n: [] for n in students}
     ranks["teacher's own sample"] = []
@@ -91,9 +95,18 @@ def main():
         drawn = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1).view(B, K)
         ranks["teacher's own sample"].append(
             rank_of.gather(2, drawn.unsqueeze(-1)).squeeze(-1).cpu())
-        for n, (st, a) in students.items():
+        for n, (st, a, mode, mask) in students.items():
             u = draw_u(left, right, a["gaussian"])
-            pred = st(u, y, mask)[0].argmax(-1)
+            out = st(u, y, mask)[0]
+            if mode == "cptp":
+                # its head is the teacher's distribution, so the token comes from
+                # inverting that CDF at this slot's own u, not from its mode
+                cq = out.softmax(-1).cumsum(-1)
+                pred = torch.searchsorted(cq.contiguous(),
+                                          u.unsqueeze(-1).contiguous()
+                                          ).squeeze(-1).clamp(max=out.shape[-1] - 1)
+            else:
+                pred = out.argmax(-1)
             ranks[n].append(rank_of.gather(2, pred.unsqueeze(-1)).squeeze(-1).cpu())
 
     ranks = {n: torch.cat(v).float() for n, v in ranks.items()}
