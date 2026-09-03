@@ -28,7 +28,7 @@ sys.path.insert(0, "/home/mengy13/VAR")
 @torch.no_grad()
 def sample_with_student(var, student, mask, B, label_B, merge_k, cells=0,
                         gaussian=False, head="ce", cfg=1.5, top_k=900,
-                        top_p=0.96, g_seed=None):
+                        top_p=0.96, g_seed=None, mode="optp", perm=None):
     from models.helpers import sample_with_top_k_top_p_
     from image_ptp.var_block_student import draw_u
     rng = None
@@ -47,7 +47,16 @@ def sample_with_student(var, student, mask, B, label_B, merge_k, cells=0,
         u = torch.rand(B, merged_L, device=dev)
         u = draw_u(u, u, gaussian)
     ce, ms = student(u, label_B, mask)
-    if head == "ce":
+    if mode == "cptp":
+        # the head is the teacher's distribution; the token comes from inverting
+        # its CDF at this slot's own u, and under an embedding ordering the
+        # index the inversion returns is a rank in that order, not a code id
+        cq = ce.softmax(-1).cumsum(-1)
+        idx = torch.searchsorted(cq.contiguous(), u.unsqueeze(-1).contiguous()
+                                 ).squeeze(-1).clamp(max=ce.shape[-1] - 1)
+        if perm is not None:
+            idx = perm.to(idx.device)[idx]
+    elif head == "ce":
         idx = ce.argmax(-1)
     else:
         # nearest codebook entry to the regressed vector: the frozen scales only
@@ -169,24 +178,31 @@ def main():
         name, ck = spec.split("=", 1)
         blob = torch.load(ck, map_location="cpu")
         a = blob["args"]
-        scales = 4
-        cells = 0
-        st = BlockStudent(pn, scales, dim=a["dim"], depth=a["depth"],
-                          n_cells=cells, u_encoding=a.get("u_encoding", "binary"))
-        st.load_state_dict(blob["model"])
+        sd = blob["model"]
+        scales, cells = 4, 0
+        mode = a.get("mode", "optp")
+        st = BlockStudent(pn, scales, vocab=sd["head_ce.weight"].shape[0],
+                          n_class=sd["cls.weight"].shape[0] - 1,
+                          dim=a["dim"], depth=a["depth"], n_cells=cells,
+                          u_encoding=a.get("u_encoding", "binary"), mode=mode)
+        st.load_state_dict(sd)
         st = st.to(device).eval()
-        mask = scale_causal_mask(pn, scales, device)
+        mask = scale_causal_mask(pn, scales, device, mode)
         # merge without the student, on the same code path, so the student's
         # contribution is the only difference between these two rows
         pre = [t.to(device) for t in expected_prefix(var, scales)]
         score(f"merge {scales}, no student",
               lambda b, lab, i: sample_merged(var, b, lab, scales, g_seed=i,
                                               prefix=pre))
-        for head in args.heads.split(","):
-            score(f"merge {scales} + {name} [{head}]",
+        perm = None
+        if a.get("train", "").find("embed") >= 0:
+            perm = torch.load(a["train"], map_location="cpu").get("perm")
+        heads = ["ce"] if mode == "cptp" else args.heads.split(",")
+        for head in heads:
+            score(f"merge {scales} + {name} [{mode}/{head}]",
                   lambda b, lab, i, h=head: sample_with_student(
                       var, st, mask, b, lab, scales, gaussian=a["gaussian"],
-                      head=h, g_seed=i))
+                      head=h, g_seed=i, mode=mode, perm=perm))
     print("STUDENT_SAMPLE_DONE")
 
 
